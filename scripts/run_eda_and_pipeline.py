@@ -1,346 +1,462 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Script: run_eda_and_pipeline.py
-Đề tài: Nghiên cứu về Multi-Scale Features, Attention Gates và Boundary-Aware Loss
-        cho bài toán phân vùng khuyết tật bề mặt nhỏ trên KolektorSDD2
-Phân hệ: Người 1 — Dataset & EDA (SEMANTIC SEGMENTATION - DEFECT ONLY)
+run_eda_and_pipeline.py — Người 1: Dataset & EDA
 
-Quy trình tự động:
-1. Dataset Audit toàn diện (quét KolektorSDD2 & Magnetic Tile).
-2. Thống kê phân bố Positive vs Negative của dữ liệu thô.
-3. Lọc 100% mẫu có khuyết tật (Defect Only) phục vụ bài toán Phân vùng ngữ nghĩa.
-4. Lọc trùng lặp thông minh dHash 256-bit nội bộ từng dataset.
-5. Phân loại khuyết tật nhỏ (Small < 1,024 px², Medium, Large) & trích xuất đường biên Boundary Map.
-6. Phân tầng Stratified Split 70% Train - 15% Val - 15% Test.
-7. Xuất bảng thống kê chi tiết dataset_statistics.csv.
-8. Sinh trọn bộ 7 biểu đồ phân tích EDA chuẩn khoa học lưu vào eda_figures/.
-9. Xuất thư mục dữ liệu phân vùng data_segmentation/ chuẩn Mask LabelMe JSON kèm mask PNG song hành.
+Chạy toàn bộ quy trình:
+  1. Dataset audit (ghép ảnh–ann, kích thước ảnh, toàn vẹn mask) cho KolektorSDD2 + Magnetic Tile
+  2. Thống kê positive / negative, diện tích khuyết tật, Small / Medium / Large
+  3. Chia Train / Val / Test phân tầng
+  4. Xuất dataset_statistics.csv  +  dataset_audit.json
+  5. Sinh các biểu đồ EDA vào eda_figures/
+  6. Xuất data_segmentation/{train,val,test}/{img, ann, masks_png} và kiểm tra lại
+
+Ví dụ:
+    python run_eda_and_pipeline.py                       # đường dẫn mặc định cạnh file này
+    python run_eda_and_pipeline.py --ksdd2-dir D:/data/kolektorsdd2-DatasetNinja \
+                                   --mt-dir D:/data/magnetic-tile-surface-defect-DatasetNinja
+    python run_eda_and_pipeline.py --no-export           # chỉ audit + EDA, không xuất dataset
+    python run_eda_and_pipeline.py --include-negatives --overwrite
+
+Các hàm `plot_*` trả về matplotlib Figure để notebook 01_eda.ipynb dùng lại.
 """
 
-import sys
-import shutil
+import argparse
+import json
 import random
+import sys
 from pathlib import Path
+from typing import Dict, List, Optional
 
+import matplotlib
 import numpy as np
 import pandas as pd
 from PIL import Image
 
-import matplotlib
-matplotlib.use('Agg')
+if __name__ == "__main__":          # chạy script: không cần cửa sổ; notebook giữ backend inline
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Import module dataset phân vùng
-from dataset import (
-    DatasetAuditor, ImageHasher, DefectSizeAnalyzer, BoundaryExtractor,
-    DatasetSplitter, CoupledSegmentationAugmentor, LabelMeDatasetExporter,
-    LabelMeJsonConverter, SampleRecord, DefectExtractor, TrainAugmentor
-)
+import dataset as D
 
 PROJECT_DIR = Path(__file__).resolve().parent
-KOLEKTOR_DIR = PROJECT_DIR / "KolektorSDD2"
-OUTPUT_SEG_DIR = PROJECT_DIR / "data_segmentation"
-FIGURES_DIR = PROJECT_DIR / "eda_figures"
-CSV_PATH = PROJECT_DIR / "dataset_statistics.csv"
+SRC_COLORS = {"KolektorSDD2": "#2563eb", "MagneticTile": "#0d9488"}
+SIZE_COLORS = {"Small": "#10b981", "Medium": "#f59e0b", "Large": "#ef4444"}
+POS_COLOR, NEG_COLOR = "#ef4444", "#3b82f6"
+plt.rcParams.update({"axes.grid": True, "grid.alpha": 0.3, "axes.axisbelow": True,
+                     "figure.dpi": 100, "savefig.bbox": "tight"})
 
 
-def generate_eda_figures(df_defects: pd.DataFrame, total_raw_pos: int, total_raw_neg: int,
-                         defect_samples: list, figures_dir: Path):
-    """
-    Sinh 7 biểu đồ phân tích EDA chuẩn khoa học (300 DPI) cho bài toán Semantic Segmentation
-    """
-    figures_dir.mkdir(parents=True, exist_ok=True)
-    plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+def _src_color(s: str) -> str:
+    return SRC_COLORS.get(s, "#6b7280")
 
-    # -------------------------------------------------------------
-    # 1. Phân bố Positive vs Negative ban đầu
-    # -------------------------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    labels = ['Clean / Negative (Không lỗi)', 'Defective / Positive (Có lỗi)']
-    vals = [total_raw_neg, total_raw_pos]
-    total_raw = total_raw_pos + total_raw_neg
 
-    bars = axes[0].bar(labels, vals, color=['#3b82f6', '#ef4444'], width=0.45, edgecolor='black')
-    for bar in bars:
-        yval = bar.get_height()
-        pct = (yval / total_raw * 100.0) if total_raw > 0 else 0
-        axes[0].text(bar.get_x() + bar.get_width()/2.0, yval + 20, f"{yval:,} ({pct:.1f}%)",
-                     ha='center', va='bottom', fontweight='bold')
-    axes[0].set_title("Phân bố mẫu Positive vs Negative trong tập dữ liệu gốc", fontsize=11, fontweight='bold')
-    axes[0].set_ylabel("Số lượng ảnh")
+def _bar_labels(ax, bars, fmt=lambda v: f"{int(v):,}", dy_frac=0.01):
+    ymax = max((b.get_height() for b in bars), default=1) or 1
+    for b in bars:
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + ymax * dy_frac, fmt(b.get_height()),
+                ha="center", va="bottom", fontsize=9, fontweight="bold")
 
-    axes[1].pie(vals, labels=labels, autopct='%1.1f%%', startangle=140,
-                colors=['#3b82f6', '#ef4444'], explode=(0, 0.08),
-                wedgeprops={'edgecolor': 'black', 'linewidth': 1.2})
-    axes[1].set_title("Tỷ lệ mẫu có lỗi (Segmentation chỉ huấn luyện tập Defective)", fontsize=11, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(figures_dir / "01_positive_negative_distribution.png", dpi=300)
-    plt.close()
 
-    # -------------------------------------------------------------
-    # 2. Phân bố nguồn dataset của tập khuyết tật
-    # -------------------------------------------------------------
-    plt.figure(figsize=(8, 5))
-    source_counts = df_defects['dataset_source'].value_counts()
-    bars = plt.bar(source_counts.index, source_counts.values, color=['#0284c7', '#0d9488'], width=0.45, edgecolor='black')
-    for bar in bars:
-        yval = bar.get_height()
-        pct = (yval / len(df_defects) * 100.0) if len(df_defects) > 0 else 0
-        plt.text(bar.get_x() + bar.get_width()/2.0, yval + 10, f"{yval:,} ảnh ({pct:.1f}%)",
-                 ha='center', va='bottom', fontweight='bold')
-    plt.title("Phân bố mẫu khuyết tật theo nguồn dữ liệu (KolektorSDD2 vs Magnetic Tile)", fontsize=11, fontweight='bold')
-    plt.ylabel("Số lượng ảnh khuyết tật")
-    plt.tight_layout()
-    plt.savefig(figures_dir / "02_dataset_sources_breakdown.png", dpi=300)
-    plt.close()
+# ==============================================================================
+# CÁC HÀM VẼ (mỗi hàm trả về Figure)
+# ==============================================================================
 
-    # -------------------------------------------------------------
-    # 3. Kích thước ảnh và Tỷ lệ khung hình (Aspect Ratio)
-    # -------------------------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    scatter = axes[0].scatter(df_defects['width'], df_defects['height'], c=df_defects['aspect_ratio'],
-                              cmap='viridis', alpha=0.6, edgecolors='none', s=45)
-    cbar = plt.colorbar(scatter, ax=axes[0])
-    cbar.set_label('Tỷ lệ Aspect Ratio (Width / Height)', rotation=270, labelpad=15)
-    axes[0].set_title("Kích thước ảnh khuyết tật (Width vs Height)", fontsize=11, fontweight='bold')
-    axes[0].set_xlabel("Chiều rộng (Pixels)")
-    axes[0].set_ylabel("Chiều cao (Pixels)")
+def plot_pos_neg(df: pd.DataFrame) -> plt.Figure:
+    """Phân bố positive (có lỗi) / negative (sạch) theo từng nguồn và tổng."""
+    srcs = sorted(df["dataset_source"].unique())
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8), gridspec_kw={"width_ratios": [1.6, 1]})
+    x = np.arange(len(srcs))
+    pos = np.array([int(df[(df.dataset_source == s) & df.is_positive].shape[0]) for s in srcs])
+    neg = np.array([int(df[(df.dataset_source == s) & ~df.is_positive].shape[0]) for s in srcs])
+    w = 0.38
+    b1 = axes[0].bar(x - w / 2, neg, w, color=NEG_COLOR, edgecolor="black", label="Negative (sạch)")
+    b2 = axes[0].bar(x + w / 2, pos, w, color=POS_COLOR, edgecolor="black", label="Positive (có lỗi)")
+    tot = pos + neg
+    for bars, vals in ((b1, neg), (b2, pos)):
+        for b, v, t in zip(bars, vals, tot):
+            axes[0].text(b.get_x() + b.get_width() / 2, v + max(tot) * 0.01,
+                         f"{v:,}\n({100 * v / max(t, 1):.1f}%)", ha="center", va="bottom", fontsize=9)
+    axes[0].set_xticks(x, srcs)
+    axes[0].set_ylim(0, max(pos.max(), neg.max()) * 1.2)
+    axes[0].set_ylabel("Số ảnh")
+    axes[0].set_title("Positive vs Negative theo nguồn", fontweight="bold")
+    axes[0].legend()
+    axes[1].pie([neg.sum(), pos.sum()], labels=["Negative", "Positive"], colors=[NEG_COLOR, POS_COLOR],
+                autopct="%1.1f%%", startangle=90, wedgeprops={"edgecolor": "black"})
+    axes[1].set_title(f"Toàn bộ ({tot.sum():,} ảnh)", fontweight="bold")
+    fig.tight_layout()
+    return fig
 
-    axes[1].hist(df_defects['aspect_ratio'], bins=25, color='#8b5cf6', edgecolor='black', alpha=0.8)
-    axes[1].axvline(df_defects['aspect_ratio'].median(), color='red', linestyle='--', linewidth=1.5,
-                    label=f"Trung vị: {df_defects['aspect_ratio'].median():.2f}")
-    axes[1].set_title("Phân phối tỷ lệ khung hình (Aspect Ratio)", fontsize=11, fontweight='bold')
-    axes[1].set_xlabel("Tỷ lệ W / H")
-    axes[1].set_ylabel("Số lượng mẫu")
+
+def plot_image_size(df: pd.DataFrame) -> plt.Figure:
+    """Kích thước ảnh (W×H) và tỷ lệ khung hình theo nguồn."""
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.8))
+    for s, g in df.groupby("dataset_source"):
+        axes[0].scatter(g.width, g.height, s=14, alpha=0.5, color=_src_color(s), label=f"{s} (n={len(g):,})")
+        axes[1].hist(g.aspect_ratio, bins=40, alpha=0.65, color=_src_color(s), label=s, edgecolor="black", linewidth=0.3)
+    axes[0].set(xlabel="Chiều rộng (px)", ylabel="Chiều cao (px)")
+    axes[0].set_title("Kích thước ảnh (W × H)", fontweight="bold")
+    axes[0].legend(markerscale=2)
+    axes[1].set(xlabel="W / H", ylabel="Số ảnh")
+    axes[1].set_title("Tỷ lệ khung hình", fontweight="bold")
     axes[1].legend()
-    plt.tight_layout()
-    plt.savefig(figures_dir / "03_image_dimensions_aspect_ratio.png", dpi=300)
-    plt.close()
-
-    # -------------------------------------------------------------
-    # 4. Phân loại quy mô khuyết tật (Small / Medium / Large)
-    # -------------------------------------------------------------
-    plt.figure(figsize=(9, 5))
-    cat_counts = df_defects['defect_size_category'].value_counts()
-    order = ['Small', 'Medium', 'Large']
-    cat_counts = cat_counts.reindex(order).dropna()
-
-    colors = {'Small': '#10b981', 'Medium': '#f59e0b', 'Large': '#ef4444'}
-    bar_colors = [colors.get(c, '#6b7280') for c in cat_counts.index]
-    bars = plt.bar(cat_counts.index, cat_counts.values, color=bar_colors, width=0.45, edgecolor='black')
-    for bar in bars:
-        yval = bar.get_height()
-        pct = (yval / len(df_defects) * 100.0) if len(df_defects) > 0 else 0
-        plt.text(bar.get_x() + bar.get_width()/2.0, yval + 10, f"{yval:,} ({pct:.1f}%)",
-                 ha='center', va='bottom', fontweight='bold')
-    plt.title("Phân loại quy mô khuyết tật bề mặt (Small: <1024px², Medium: 1024-4096px², Large: >4096px²)",
-              fontsize=11, fontweight='bold')
-    plt.ylabel("Số lượng ảnh khuyết tật")
-    plt.tight_layout()
-    plt.savefig(figures_dir / "04_defect_size_categories_segmentation.png", dpi=300)
-    plt.close()
-
-    # -------------------------------------------------------------
-    # 5. Phân phối diện tích khuyết tật (Log scale & Relative %)
-    # -------------------------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    axes[0].hist(df_defects['defect_area_pixels'], bins=35, color='#0284c7', edgecolor='black', alpha=0.8)
-    axes[0].set_yscale('log')
-    axes[0].set_title("Phân phối diện tích khuyết tật (Pixels² - Log scale)", fontsize=11, fontweight='bold')
-    axes[0].set_xlabel("Diện tích khuyết tật (Pixels²)")
-    axes[0].set_ylabel("Số lượng mẫu (Thang Log)")
-
-    axes[1].boxplot(df_defects['relative_defect_area_pct'], vert=False, patch_artist=True,
-                    boxprops=dict(facecolor='#a7f3d0', color='black'),
-                    medianprops=dict(color='red', linewidth=2))
-    axes[1].set_title("Tỷ lệ % diện tích khuyết tật trên toàn bộ ảnh", fontsize=11, fontweight='bold')
-    axes[1].set_xlabel("Tỷ lệ % diện tích (%)")
-    plt.tight_layout()
-    plt.savefig(figures_dir / "05_defect_area_distribution.png", dpi=300)
-    plt.close()
-
-    # -------------------------------------------------------------
-    # 6. Trực quan hóa Mẫu phân vùng (Image, Mask, Overlay, Boundary Map)
-    # -------------------------------------------------------------
-    pos_samples = [s for s in defect_samples if s.mask_path and s.mask_path.exists()]
-    n_display = min(4, len(pos_samples))
-    if n_display > 0:
-        rng = random.Random(42)
-        selected = rng.sample(pos_samples, n_display)
-
-        fig, axes = plt.subplots(n_display, 4, figsize=(16, 3.8 * n_display))
-        if n_display == 1:
-            axes = np.expand_dims(axes, axis=0)
-
-        for row_idx, s in enumerate(selected):
-            img = Image.open(s.image_path).convert('RGB')
-            axes[row_idx, 0].imshow(img)
-            axes[row_idx, 0].set_title(f"Ảnh: {s.sample_id}", fontsize=10, fontweight='bold')
-            axes[row_idx, 0].axis('off')
-
-            mask = Image.open(s.mask_path).convert('L')
-            mask_np = np.array(mask)
-            axes[row_idx, 1].imshow(mask_np, cmap='gray')
-            axes[row_idx, 1].set_title(f"Mask ({s.defect_info.total_area_pixels}px - {s.defect_info.category})",
-                                       fontsize=10, fontweight='bold')
-            axes[row_idx, 1].axis('off')
-
-            overlay = np.array(img).copy()
-            binary_mask = mask_np > 127
-            overlay[binary_mask] = [255, 40, 40]
-            axes[row_idx, 2].imshow(overlay)
-            axes[row_idx, 2].set_title("Mask Overlay (Đỏ)", fontsize=10, fontweight='bold')
-            axes[row_idx, 2].axis('off')
-
-            boundary = BoundaryExtractor.extract_boundary(binary_mask)
-            axes[row_idx, 3].imshow(boundary, cmap='hot')
-            axes[row_idx, 3].set_title(f"Boundary Map ({s.defect_info.boundary_perimeter_px}px)",
-                                       fontsize=10, fontweight='bold')
-            axes[row_idx, 3].axis('off')
-
-        plt.tight_layout()
-        plt.savefig(figures_dir / "06_segmentation_visualizations.png", dpi=300)
-        plt.close()
-
-    # -------------------------------------------------------------
-    # 7. Phân phối trên 3 tập Train / Val / Test
-    # -------------------------------------------------------------
-    plt.figure(figsize=(9, 5))
-    split_cat = df_defects.groupby(['split', 'defect_size_category']).size().unstack(fill_value=0)
-    for c in ['Small', 'Medium', 'Large']:
-        if c not in split_cat.columns:
-            split_cat[c] = 0
-    split_cat = split_cat[['Small', 'Medium', 'Large']]
-
-    ax = split_cat.plot(kind='bar', stacked=True, color=['#10b981', '#f59e0b', '#ef4444'],
-                        figsize=(9, 5), edgecolor='black')
-    plt.title("Phân bố mẫu khuyết tật trên 3 tập Train (70%) - Val (15%) - Test (15%)", fontsize=11, fontweight='bold')
-    plt.xlabel("Tập dữ liệu")
-    plt.ylabel("Số lượng ảnh khuyết tật")
-    plt.legend(title="Quy mô lỗi")
-    plt.xticks(rotation=0)
-    plt.tight_layout()
-    plt.savefig(figures_dir / "07_train_val_test_split.png", dpi=300)
-    plt.close()
-
-    print(f"  [OK] Đã xuất 7 biểu đồ phân tích EDA chất lượng cao vào: {figures_dir}")
+    pix = (df.width * df.height / 1e3)
+    axes[2].boxplot([pix[df.dataset_source == s] for s in sorted(df.dataset_source.unique())],
+                    tick_labels=sorted(df.dataset_source.unique()), patch_artist=True)
+    axes[2].set_ylabel("Diện tích ảnh (nghìn px)")
+    axes[2].set_title("Diện tích ảnh", fontweight="bold")
+    fig.tight_layout()
+    return fig
 
 
-def main():
-    print("=" * 80)
-    print(" BÀI TOÁN PHÂN VÙNG KHUYẾT TẬT BỀ MẶT NHỎ (SEMANTIC SEGMENTATION)")
-    print(" ĐỀ TÀI: Multi-Scale Features, Attention Gates & Boundary-Aware Loss")
-    print(" PIPELINE: AUDIT -> DEFECT-ONLY FILTER -> LABELME JSON -> TRAIN/VAL/TEST")
-    print("=" * 80)
+def plot_mask_integrity(df: pd.DataFrame, reports: Dict[str, dict]) -> plt.Figure:
+    """Toàn vẹn cặp ảnh–ann–mask: số mẫu OK / có lỗi và các lỗi cấp tệp (thiếu ann, ann mồ côi, ảnh hỏng...)."""
+    srcs = sorted(df["dataset_source"].unique())
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.6), gridspec_kw={"width_ratios": [1, 1.5]})
+    ok = [int((df[df.dataset_source == s].integrity_status == "OK").sum()) for s in srcs]
+    bad = [int((df[df.dataset_source == s].integrity_status != "OK").sum()) for s in srcs]
+    axes[0].bar(srcs, ok, color="#10b981", edgecolor="black", label="OK")
+    axes[0].bar(srcs, bad, bottom=ok, color="#ef4444", edgecolor="black", label="Có vấn đề")
+    for i, (o, b) in enumerate(zip(ok, bad)):
+        axes[0].text(i, o + b, f"{o:,} OK / {b:,} lỗi", ha="center", va="bottom", fontsize=9, fontweight="bold")
+    axes[0].set_ylim(0, max(o + b for o, b in zip(ok, bad)) * 1.15)
+    axes[0].set_title("Tính toàn vẹn mẫu (ảnh + ann + mask)", fontweight="bold")
+    axes[0].legend()
 
-    # -------------------------------------------------------------
-    # BƯỚC 1: Quét toàn diện KolektorSDD2 (Cả Positive & Negative để Audit)
-    # -------------------------------------------------------------
-    print("\n[Bước 1/6] Quét kiểm toán tập dữ liệu gốc KolektorSDD2...")
-    all_kolektor = DatasetAuditor.scan_kolektor(KOLEKTOR_DIR, defect_only=False)
-    k_pos = sum(1 for s in all_kolektor if s.has_defect)
-    k_neg = len(all_kolektor) - k_pos
-    print(f"  -> Quét xong KolektorSDD2: Tổng {len(all_kolektor):,} ảnh (Có lỗi: {k_pos:,} | Sạch: {k_neg:,})")
+    rows = []
+    for s in srcs:
+        r, g = reports.get(s, {}), df[df.dataset_source == s]
+        rows.append([s, r.get("n_images", "?"), r.get("n_ann_files", "?"), len(r.get("missing_ann", [])),
+                     len(r.get("orphan_ann", [])), len(r.get("corrupt_images", [])),
+                     len(r.get("bad_ann_json", [])), int(g.integrity_status.str.contains("SIZE_MISMATCH").sum()),
+                     int(g.integrity_status.str.contains("BITMAP_OUT_OF_BOUNDS").sum())])
+    axes[1].axis("off")
+    tb = axes[1].table(cellText=rows, loc="center", cellLoc="center",
+                       colLabels=["Nguồn", "Ảnh", "Ann", "Thiếu\nann", "Ann\nmồ côi", "Ảnh\nhỏng",
+                                  "Ann\nhỏng", "Lệch\nkích thước", "Bitmap\ntràn biên"])
+    tb.auto_set_font_size(False)
+    tb.set_fontsize(9)
+    tb.scale(1, 2.2)
+    axes[1].set_title("Báo cáo kiểm toán cấp tệp", fontweight="bold")
+    fig.tight_layout()
+    return fig
 
-    # -------------------------------------------------------------
-    # BƯỚC 2: Quét toàn diện Magnetic Tile
-    # -------------------------------------------------------------
-    print("\n[Bước 2/6] Quét kiểm toán tập dữ liệu bổ trợ Magnetic Tile...")
-    mt_dir = DatasetAuditor.locate_magnetic_tile_dir(PROJECT_DIR)
-    all_mt = []
-    if mt_dir:
-        print(f"  -> Tìm thấy thư mục: {mt_dir.name}")
-        all_mt = DatasetAuditor.scan_magnetic_tile(mt_dir, defect_only=False)
-        m_pos = sum(1 for s in all_mt if s.has_defect)
-        m_neg = len(all_mt) - m_pos
-        print(f"  -> Quét xong Magnetic Tile: Tổng {len(all_mt):,} ảnh (Có lỗi: {m_pos:,} | Sạch: {m_neg:,})")
+
+def plot_defect_area(df: pd.DataFrame) -> plt.Figure:
+    """Phân phối diện tích khuyết tật (px², thang log) và % diện tích trên ảnh."""
+    pos = df[df.is_positive]
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.8))
+    lo, hi = max(1, pos.defect_area_px.min()), pos.defect_area_px.max()
+    bins = np.logspace(np.log10(lo), np.log10(max(hi, lo * 10)), 35)
+    for s, g in pos.groupby("dataset_source"):
+        axes[0].hist(g.defect_area_px, bins=bins, alpha=0.65, color=_src_color(s),
+                     edgecolor="black", linewidth=0.3, label=f"{s} (n={len(g):,}, median={g.defect_area_px.median():,.0f})")
+    axes[0].set_xscale("log")
+    axes[0].axvline(D.SMALL_MAX_PX, color="k", ls="--", lw=1)
+    axes[0].axvline(D.MEDIUM_MAX_PX, color="k", ls=":", lw=1)
+    axes[0].set(xlabel="Diện tích khuyết tật (px², log)", ylabel="Số ảnh")
+    axes[0].set_title("Phân phối diện tích khuyết tật", fontweight="bold")
+    axes[0].legend(fontsize=8)
+    srcs = sorted(pos.dataset_source.unique())
+    axes[1].boxplot([pos[pos.dataset_source == s].relative_defect_area_pct for s in srcs],
+                    tick_labels=srcs, patch_artist=True, vert=True)
+    axes[1].set_yscale("log")
+    axes[1].set_ylabel("% diện tích ảnh bị lỗi (log)")
+    axes[1].set_title("Tỷ lệ diện tích lỗi / diện tích ảnh", fontweight="bold")
+    fig.tight_layout()
+    return fig
+
+
+def plot_size_categories(df: pd.DataFrame) -> plt.Figure:
+    """Số ảnh positive theo Small / Medium / Large, từng nguồn và gộp."""
+    pos = df[df.is_positive]
+    srcs = sorted(pos.dataset_source.unique()) + ["Tất cả"]
+    fig, axes = plt.subplots(1, len(srcs), figsize=(4.6 * len(srcs), 4.4), sharey=False)
+    axes = np.atleast_1d(axes)
+    for ax, s in zip(axes, srcs):
+        g = pos if s == "Tất cả" else pos[pos.dataset_source == s]
+        vc = g.size_category.value_counts().reindex(D.SIZE_ORDER).fillna(0)
+        bars = ax.bar(vc.index, vc.values, color=[SIZE_COLORS[c] for c in vc.index], edgecolor="black")
+        for b, v in zip(bars, vc.values):
+            ax.text(b.get_x() + b.get_width() / 2, v + max(vc.max(), 1) * 0.01,
+                    f"{int(v):,}\n({100 * v / max(len(g), 1):.1f}%)", ha="center", va="bottom", fontsize=9)
+        ax.set_ylim(0, max(vc.max(), 1) * 1.25)
+        ax.set_title(f"{s} (n={len(g):,})", fontweight="bold")
+    fig.suptitle(f"Small < {D.SMALL_MAX_PX:,} px² ≤ Medium ≤ {D.MEDIUM_MAX_PX:,} px² < Large", fontsize=11, y=1.02)
+    fig.tight_layout()
+    return fig
+
+
+def plot_area_ecdf(df: pd.DataFrame) -> plt.Figure:
+    """ECDF diện tích khuyết tật: cho thấy ngưỡng Small/Medium/Large cắt phân phối thật ở đâu."""
+    pos = df[df.is_positive]
+    fig, ax = plt.subplots(figsize=(8.5, 4.8))
+    for s, g in pos.groupby("dataset_source"):
+        v = np.sort(g.defect_area_px.values)
+        ax.step(v, np.arange(1, len(v) + 1) / len(v), where="post", color=_src_color(s), lw=2, label=s)
+        for q in (0.25, 0.5, 0.75):
+            ax.plot(np.quantile(v, q), q, "o", color=_src_color(s), ms=4)
+    for thr, name in ((D.SMALL_MAX_PX, "Small|Medium"), (D.MEDIUM_MAX_PX, "Medium|Large")):
+        ax.axvline(thr, color="k", ls="--", lw=1)
+        ax.text(thr, 0.03, f" {name}\n {thr:,}px²", fontsize=8)
+    ax.set_xscale("log")
+    ax.set(xlabel="Diện tích khuyết tật (px², log)", ylabel="Tỷ lệ tích lũy")
+    ax.set_title("ECDF diện tích khuyết tật (chấm = tứ phân vị)", fontweight="bold")
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def plot_components(df: pd.DataFrame, comp_df: pd.DataFrame) -> plt.Figure:
+    """Phân tích ở mức từng vùng lỗi liên thông: diện tích mỗi vùng và số vùng mỗi ảnh."""
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.6))
+    if len(comp_df):
+        bins = np.logspace(0, np.log10(max(comp_df.component_area_px.max(), 10)), 35)
+        for s, g in comp_df.groupby("dataset_source"):
+            axes[0].hist(g.component_area_px, bins=bins, alpha=0.65, color=_src_color(s),
+                         edgecolor="black", linewidth=0.3, label=f"{s} (n={len(g):,})")
+        axes[0].set_xscale("log")
+        axes[0].axvline(D.SMALL_MAX_PX, color="k", ls="--", lw=1)
+        axes[0].axvline(D.MEDIUM_MAX_PX, color="k", ls=":", lw=1)
+        axes[0].legend(fontsize=8)
+        cc = comp_df.groupby(["dataset_source", "size_category"]).size().unstack(fill_value=0)
+        cc = cc.reindex(columns=D.SIZE_ORDER, fill_value=0)
+        cc.plot(kind="bar", ax=axes[1], color=[SIZE_COLORS[c] for c in cc.columns], edgecolor="black", rot=0)
+    axes[0].set(xlabel="Diện tích 1 vùng lỗi (px², log)", ylabel="Số vùng lỗi")
+    axes[0].set_title("Diện tích từng vùng lỗi", fontweight="bold")
+    axes[1].set_title("Số vùng lỗi theo Small/Medium/Large", fontweight="bold")
+    axes[1].set_xlabel("")
+    pos = df[df.is_positive]
+    nc = pos.num_components.clip(upper=8)
+    for i, (s, g) in enumerate(pos.assign(nc=nc).groupby("dataset_source")):
+        vc = g.nc.value_counts().sort_index()
+        axes[2].bar(vc.index + (i - 0.5) * 0.38, vc.values, 0.38, color=_src_color(s), edgecolor="black", label=s)
+    axes[2].set(xlabel="Số vùng lỗi liên thông / ảnh (8 = ≥8)", ylabel="Số ảnh")
+    axes[2].set_title("Số vùng lỗi mỗi ảnh", fontweight="bold")
+    axes[2].legend()
+    fig.tight_layout()
+    return fig
+
+
+def plot_mt_classes(df: pd.DataFrame) -> Optional[plt.Figure]:
+    """Magnetic Tile: số ảnh và diện tích lỗi theo loại khuyết tật chính."""
+    mt = df[(df.dataset_source == "MagneticTile") & df.is_positive]
+    if mt.empty:
+        return None
+    order = mt.primary_class.value_counts().index.tolist()
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6))
+    vc = mt.primary_class.value_counts().reindex(order)
+    bars = axes[0].bar(vc.index, vc.values, color="#0d9488", edgecolor="black")
+    _bar_labels(axes[0], bars)
+    axes[0].set(ylabel="Số ảnh")
+    axes[0].set_title("Magnetic Tile: số ảnh theo loại lỗi chính", fontweight="bold")
+    axes[1].boxplot([mt[mt.primary_class == c].defect_area_px for c in order], tick_labels=order, patch_artist=True)
+    axes[1].set_yscale("log")
+    axes[1].axhline(D.SMALL_MAX_PX, color="k", ls="--", lw=1)
+    axes[1].axhline(D.MEDIUM_MAX_PX, color="k", ls=":", lw=1)
+    axes[1].set_ylabel("Diện tích lỗi (px², log)")
+    axes[1].set_title("Diện tích lỗi theo loại", fontweight="bold")
+    fig.tight_layout()
+    return fig
+
+
+def plot_splits(df: pd.DataFrame) -> plt.Figure:
+    """Phân bố Train/Val/Test: theo nguồn, theo positive/negative, theo kích thước."""
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.6))
+    sp = [s for s in D.SPLITS if s in set(df.split)]
+    t = df.groupby(["split", "dataset_source"]).size().unstack(fill_value=0).reindex(sp)
+    t.plot(kind="bar", stacked=True, ax=axes[0], color=[_src_color(c) for c in t.columns], edgecolor="black", rot=0)
+    axes[0].set_title("Số ảnh theo split và nguồn", fontweight="bold")
+    p = df.groupby(["split", "is_positive"]).size().unstack(fill_value=0).reindex(sp)
+    p = p.rename(columns={True: "Positive", False: "Negative"})
+    p.plot(kind="bar", ax=axes[1], color={"Positive": POS_COLOR, "Negative": NEG_COLOR}, edgecolor="black", rot=0)
+    for c in axes[1].containers:
+        axes[1].bar_label(c, fontsize=8)
+    axes[1].set_title("Positive / Negative theo split", fontweight="bold")
+    z = df[df.is_positive].groupby(["split", "size_category"]).size().unstack(fill_value=0)
+    z = z.reindex(index=sp, columns=D.SIZE_ORDER, fill_value=0)
+    z.plot(kind="bar", stacked=True, ax=axes[2], color=[SIZE_COLORS[c] for c in z.columns], edgecolor="black", rot=0)
+    axes[2].set_title("Small/Medium/Large (positive) theo split", fontweight="bold")
+    for a in axes:
+        a.set_xlabel("")
+        a.margins(y=0.12)
+    fig.tight_layout()
+    return fig
+
+
+def _load_overlay(rec: "D.SampleRecord"):
+    img = np.array(Image.open(rec.img_path).convert("RGB"))
+    with open(rec.ann_path, encoding="utf-8") as f:
+        mask, _ = D.ann_to_mask(json.load(f), rec.width, rec.height)
+    return img, mask
+
+
+def plot_samples(records: List["D.SampleRecord"], per_group: int = 1, seed: int = 42) -> Optional[plt.Figure]:
+    """Ảnh | mask | overlay | boundary — mỗi (nguồn, Small/Medium/Large) lấy `per_group` mẫu."""
+    rng = random.Random(seed)
+    picks = []
+    for s in sorted({r.source for r in records}):
+        for c in D.SIZE_ORDER:
+            pool = [r for r in records if r.source == s and r.size_category == c]
+            picks += rng.sample(pool, min(per_group, len(pool)))
+    if not picks:
+        return None
+    fig, axes = plt.subplots(len(picks), 4, figsize=(13, 3.1 * len(picks)))
+    axes = np.atleast_2d(axes)
+    for row, r in zip(axes, picks):
+        img, mask = _load_overlay(r)
+        ov = img.copy()
+        ov[mask > 0] = (0.4 * ov[mask > 0] + 0.6 * np.array([255, 30, 30])).astype(np.uint8)
+        b = D.extract_boundary(mask)
+        for a, im, ttl, cm in zip(row, (img, mask, ov, b),
+                                  (f"{r.sample_id}", f"Mask ({r.area_px:,}px², {r.size_category})",
+                                   f"Overlay [{'/'.join(r.classes)}]", f"Boundary ({r.perimeter_px:.0f}px)"),
+                                  (None, "gray", None, "hot")):
+            a.imshow(im, cmap=cm)
+            a.set_title(ttl, fontsize=9)
+            a.axis("off")
+    fig.tight_layout()
+    return fig
+
+
+def plot_augmentation(rec: "D.SampleRecord", n: int = 5, seed: int = 0) -> plt.Figure:
+    """Minh họa augmentation đồng bộ: hàng trên = ảnh, hàng dưới = mask; cột 0 = bản gốc."""
+    img, mask = _load_overlay(rec)
+    aug = D.CoupledAugmentor(seed=seed)
+    fig, axes = plt.subplots(2, n + 1, figsize=(2.6 * (n + 1), 6.2))
+    axes[0, 0].imshow(img)
+    axes[1, 0].imshow(mask, cmap="gray")
+    axes[0, 0].set_title("Gốc")
+    for k in range(1, n + 1):
+        a_img, a_mask = aug(img, mask)
+        axes[0, k].imshow(a_img)
+        axes[1, k].imshow(a_mask, cmap="gray")
+        axes[0, k].set_title(f"Aug #{k}")
+    for a in axes.ravel():
+        a.axis("off")
+    fig.suptitle(f"Coupled augmentation — {rec.sample_id}", y=1.0)
+    fig.tight_layout()
+    return fig
+
+
+# ==============================================================================
+# PIPELINE
+# ==============================================================================
+
+def audit_all(ksdd2_dir: Path, mt_dir: Path):
+    """Quét cả hai dataset. Trả về (records, reports {tên nguồn: report})."""
+    records, reports = [], {}
+    for spec in (D.make_ksdd2_spec(ksdd2_dir), D.make_mt_spec(mt_dir)):
+        if not spec.subsets:
+            print(f"  [Cảnh báo] Không tìm thấy dữ liệu {spec.name} tại: {spec.root}")
+            continue
+        recs, rep = D.scan_dataset(spec)
+        records += recs
+        reports[spec.name] = rep
+        npos = sum(r.is_positive for r in recs)
+        print(f"  {spec.name:13s}: {rep['n_images']:,} ảnh / {rep['n_ann_files']:,} ann -> hợp lệ {len(recs):,} "
+              f"(positive {npos:,} | negative {len(recs) - npos:,}) | thiếu ann {len(rep['missing_ann'])}, "
+              f"ann mồ côi {len(rep['orphan_ann'])}, ảnh hỏng {len(rep['corrupt_images'])}, "
+              f"ann hỏng {len(rep['bad_ann_json'])}")
+    return records, reports
+
+
+def save_all_figures(df, records, reports, comp_df, figures_dir: Path, dpi: int = 200) -> List[Path]:
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    pos_recs = [r for r in records if r.is_positive]
+    jobs = [
+        ("01_positive_negative_distribution", lambda: plot_pos_neg(df)),
+        ("02_image_size_aspect_ratio", lambda: plot_image_size(df)),
+        ("03_mask_integrity_audit", lambda: plot_mask_integrity(df, reports)),
+        ("04_defect_area_distribution", lambda: plot_defect_area(df)),
+        ("05_defect_size_categories", lambda: plot_size_categories(df)),
+        ("06_defect_area_ecdf", lambda: plot_area_ecdf(df)),
+        ("07_defect_components", lambda: plot_components(df, comp_df)),
+        ("08_magnetic_tile_classes", lambda: plot_mt_classes(df)),
+        ("09_train_val_test_split", lambda: plot_splits(df)),
+        ("10_segmentation_samples", lambda: plot_samples(pos_recs)),
+        ("11_augmentation_preview", lambda: plot_augmentation(pos_recs[0]) if pos_recs else None),
+    ]
+    saved = []
+    for name, fn in jobs:
+        fig = fn()
+        if fig is None:
+            continue
+        path = figures_dir / f"{name}.png"
+        fig.savefig(path, dpi=dpi)
+        plt.close(fig)
+        saved.append(path)
+    return saved
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Dataset audit + EDA + chia split + xuất data_segmentation/")
+    ap.add_argument("--ksdd2-dir", type=Path, default=PROJECT_DIR / "kolektorsdd2-DatasetNinja")
+    ap.add_argument("--mt-dir", type=Path, default=PROJECT_DIR / "magnetic-tile-surface-defect-DatasetNinja")
+    ap.add_argument("--out-dir", type=Path, default=PROJECT_DIR / "data_segmentation")
+    ap.add_argument("--figures-dir", type=Path, default=PROJECT_DIR / "eda_figures")
+    ap.add_argument("--csv", type=Path, default=PROJECT_DIR / "dataset_statistics.csv")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--include-negatives", action="store_true", help="xuất cả ảnh sạch vào data_segmentation/")
+    ap.add_argument("--resplit-ksdd2", action="store_true",
+                    help="chia lại KSDD2 70/15/15 thay vì giữ tập test chính thức")
+    ap.add_argument("--check-duplicates", action="store_true", help="báo cáo ảnh gần trùng (dHash)")
+    ap.add_argument("--no-export", action="store_true", help="chỉ audit + EDA, không xuất data_segmentation/")
+    ap.add_argument("--overwrite", action="store_true", help="ghi đè train/val/test trong --out-dir")
+    a = ap.parse_args(argv)
+
+    print("=" * 78)
+    print(" NGƯỜI 1 — DATASET & EDA | KolektorSDD2 + Magnetic Tile")
+    print("=" * 78)
+    print("\n[1/5] Kiểm toán dataset (ghép ảnh–ann, giải mã mask, đo khuyết tật)...")
+    records, reports = audit_all(a.ksdd2_dir, a.mt_dir)
+    if not records:
+        print("Không đọc được mẫu nào. Kiểm tra lại --ksdd2-dir / --mt-dir.")
+        return 1
+
+    print("\n[2/5] Chia Train/Val/Test phân tầng...")
+    D.assign_splits(records, seed=a.seed, respect_official=not a.resplit_ksdd2)
+    df = D.records_to_dataframe(records, base_dir=PROJECT_DIR)
+    comp_df = D.components_dataframe(records)
+    print(pd.crosstab([df.dataset_source, df.is_positive], df.split, margins=True).to_string())
+
+    if a.check_duplicates:
+        pairs = D.find_near_duplicates(records)
+        by_id = {r.sample_id: r for r in records}
+        cross = [p for p in pairs if by_id[p[0]].split != by_id[p[1]].split]
+        print(f"  Cặp ảnh gần trùng: {len(pairs)} (trong đó khác split — rò rỉ tiềm ẩn: {len(cross)})")
+
+    print("\n[3/5] Ghi dataset_statistics.csv + dataset_audit.json...")
+    df["exported"] = df.is_positive | a.include_negatives
+    df.to_csv(a.csv, index=False, encoding="utf-8-sig")
+    audit_json = a.csv.with_name("dataset_audit.json")
+    with open(audit_json, "w", encoding="utf-8") as f:
+        json.dump({"thresholds_px2": {"small_lt": D.SMALL_MAX_PX, "medium_le": D.MEDIUM_MAX_PX},
+                   "reports": reports,
+                   "integrity_counts": df.integrity_status.value_counts().to_dict()},
+                  f, indent=2, ensure_ascii=False)
+    print(f"  -> {a.csv} ({len(df):,} dòng), {audit_json}")
+
+    print("\n[4/5] Sinh biểu đồ EDA...")
+    saved = save_all_figures(df, records, reports, comp_df, a.figures_dir)
+    print(f"  -> {len(saved)} biểu đồ trong {a.figures_dir}")
+
+    if a.no_export:
+        print("\n[5/5] Bỏ qua xuất dataset (--no-export).")
     else:
-        m_pos, m_neg = 0, 0
-        print("  -> [Cảnh báo] Không tìm thấy thư mục Magnetic Tile.")
-
-    total_raw_pos = k_pos + m_pos
-    total_raw_neg = k_neg + m_neg
-    total_raw = len(all_kolektor) + len(all_mt)
-    print(f"\n---> TỔNG CỘNG THU THẬP BAN ĐẦU: {total_raw:,} ảnh")
-    print(f"     + Mẫu có lỗi (Positive) : {total_raw_pos:,} ảnh ({total_raw_pos/total_raw*100:.1f}%)")
-    print(f"     + Mẫu sạch (Negative)   : {total_raw_neg:,} ảnh ({total_raw_neg/total_raw*100:.1f}%)")
-
-    # -------------------------------------------------------------
-    # BƯỚC 3: Lọc 100% Defect Only & Khử trùng lặp dHash 256-bit
-    # -------------------------------------------------------------
-    print("\n[Bước 3/6] Lọc 100% mẫu có khuyết tật (Defect Only) & Khử trùng lặp dHash...")
-    raw_defect_samples = [s for s in (all_kolektor + all_mt) if s.has_defect]
-    print(f"  -> Số mẫu có khuyết tật trước lọc trùng: {len(raw_defect_samples):,} ảnh")
-
-    unique_defect_samples, dup_stats = ImageHasher.deduplicate(raw_defect_samples, threshold=2)
-    print("  -> Thống kê lọc trùng lặp nội bộ (Hamming <= 2):")
-    for src, cnt in dup_stats.items():
-        print(f"     + Nguồn {src}: loại bỏ {cnt:,} ảnh trùng.")
-    print(f"  -> Số ảnh khuyết tật sạch duy nhất giữ lại: {len(unique_defect_samples):,} ảnh.")
-
-    # -------------------------------------------------------------
-    # BƯỚC 4: Phân chia phân tầng 70% Train - 15% Val - 15% Test
-    # -------------------------------------------------------------
-    print("\n[Bước 4/6] Phân chia phân tầng Stratified Split (70% Train - 15% Val - 15% Test)...")
-    DatasetSplitter.split(unique_defect_samples, train_r=0.7, val_r=0.15, test_r=0.15, seed=42)
-    split_counts = pd.Series([s.split for s in unique_defect_samples]).value_counts()
-    print(f"  -> Phân bổ: Train: {split_counts.get('train', 0):,} | Val: {split_counts.get('val', 0):,} | Test: {split_counts.get('test', 0):,}")
-
-    # -------------------------------------------------------------
-    # BƯỚC 5: Xuất file dataset_statistics.csv
-    # -------------------------------------------------------------
-    print("\n[Bước 5/6] Xuất bảng thống kê phân vùng dataset_statistics.csv...")
-    records_data = []
-    for s in unique_defect_samples:
-        info = s.defect_info
-        records_data.append({
-            "sample_id": s.sample_id,
-            "dataset_source": s.dataset_source,
-            "filename": s.image_path.name,
-            "width": s.width,
-            "height": s.height,
-            "channels": s.channels,
-            "aspect_ratio": s.aspect_ratio,
-            "has_defect": s.has_defect,
-            "defect_size_category": info.category,
-            "defect_area_pixels": info.total_area_pixels,
-            "relative_defect_area_pct": info.relative_area_pct,
-            "num_defect_components": info.num_components,
-            "boundary_perimeter_px": info.boundary_perimeter_px,
-            "split": s.split,
-            "integrity_status": s.integrity_status
-        })
-
-    df_defects = pd.DataFrame(records_data)
-    df_defects.to_csv(CSV_PATH, index=False, encoding='utf-8-sig')
-    print(f"  [OK] Đã lưu bảng thống kê phân vùng ({len(df_defects):,} dòng) tại: {CSV_PATH}")
-
-    # -------------------------------------------------------------
-    # BƯỚC 6: Sinh 7 biểu đồ phân tích EDA
-    # -------------------------------------------------------------
-    print("\n[Bước 6/6] Sinh 7 biểu đồ EDA lưu vào eda_figures/...")
-    generate_eda_figures(df_defects, total_raw_pos, total_raw_neg, unique_defect_samples, FIGURES_DIR)
-
-    # -------------------------------------------------------------
-    # BƯỚC 7: Xuất cấu trúc thư mục Semantic Segmentation với LabelMe JSON
-    # -------------------------------------------------------------
-    print(f"\n---> Xuất bộ dữ liệu ra thư mục: {OUTPUT_SEG_DIR}")
-    counts = LabelMeDatasetExporter.export(unique_defect_samples, OUTPUT_SEG_DIR, apply_train_aug=True)
-    print(f"  [OK] Hoàn tất xuất Segmentation Dataset:")
-    print(f"       + Train: {counts['train']} mẫu (đã kèm Coupled Augmentation: HFlip, VFlip, Rot90)")
-    print(f"       + Val  : {counts['val']} mẫu (giữ nguyên gốc)")
-    print(f"       + Test : {counts['test']} mẫu (giữ nguyên gốc)")
-    print(f"       + Mask định dạng: LabelMe JSON (.json) trong thư mục masks/ kèm PNG trong masks_png/")
-
-    print("\n" + "=" * 80)
-    print("        HOÀN TẤT PIPELINE TIỀN XỬ LÝ CHO BÀI TOÁN SEGMENTATION!")
-    print("=" * 80)
-    print(f"1. Thư mục dataset phân vùng : {OUTPUT_SEG_DIR}")
-    print(f"2. Bảng thống kê dữ liệu CSV : {CSV_PATH}")
-    print(f"3. Thư mục biểu đồ EDA       : {FIGURES_DIR}")
-    print("=" * 80)
+        print(f"\n[5/5] Xuất dataset ra {a.out_dir} ...")
+        counts = D.export_dataset(records, a.out_dir, include_negatives=a.include_negatives, overwrite=a.overwrite)
+        print("  Số mẫu:", counts)
+        v = D.verify_export(a.out_dir)
+        print(f"  Kiểm tra sau xuất: {v['n_checked']:,} ảnh, {len(v['problems'])} vấn đề")
+        for p in v["problems"][:10]:
+            print("   !", p)
+        if v["problems"]:
+            return 2
+    print("\nHOÀN TẤT.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

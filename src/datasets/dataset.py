@@ -1,732 +1,681 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Module: dataset.py
-Đề tài: Nghiên cứu về Multi-Scale Features, Attention Gates và Boundary-Aware Loss
-        cho bài toán phân vùng khuyết tật bề mặt nhỏ trên KolektorSDD2
-Phân hệ: Người 1 — Dataset & EDA (SEMANTIC SEGMENTATION - DEFECT ONLY PIPELINE)
+dataset.py — Người 1: Dataset & EDA
+Đề tài: Multi-Scale Features, Attention Gates và Boundary-Aware Loss
+        cho phân vùng khuyết tật bề mặt nhỏ (KolektorSDD2 + Magnetic Tile)
 
-Quy chuẩn xử lý:
-1. LỌC 100% MẪU CÓ DEFECT:
-   - Bài toán là Semantic Segmentation, loại bỏ hoàn toàn ảnh sạch (Negative).
-   - Chỉ giữ lại ảnh chứa khuyết tật thực sự (has_defect == True).
-2. MASK ĐỊNH DẠNG LABELME JSON:
-   - Mask được lưu trữ ở định dạng chuẩn LabelMe JSON (.json).
-   - File JSON chứa polygons (points: [[x, y], ...]), label: "defect", imageHeight, imageWidth, v.v.
-   - Hỗ trợ lọc mẫu dựa trên metadata trong file JSON (kiểm tra shapes có chứa nhãn "defect").
-   - Kèm thư mục masks_png/ phục vụ nạp trực tiếp vào PyTorch DataLoader tốc độ cao.
-3. ĐẶT TÊN ĐỒNG NHẤT VỚI TIỀN TỐ NGUỒN:
-   - KolektorSDD2: `ksdd2_defect_0001.png` kèm `ksdd2_defect_0001.json`
-   - Magnetic Tile: `mt_<defect_type>_defect_0001.png` kèm `mt_<defect_type>_defect_0001.json`
-4. HỖ TRỢ BOUNDARY-AWARE LOSS:
-   - Trích xuất bản đồ ranh giới/đường biên (Boundary Edge Map) trực tiếp từ mask.
-5. PHÂN LOẠI KHUYẾT TẬT NHỎ (SMALL DEFECTS):
-   - Small: < 1,024 px² (< 0.5% diện tích)
-   - Medium: 1,024 ~ 4,096 px²
-   - Large: > 4,096 px²
-6. STRATIFIED SPLIT:
-   - Phân chia phân tầng 70% Train - 15% Val - 15% Test trên tập khuyết tật.
-7. COUPLED AUGMENTATION:
-   - Tăng cường đồng bộ (Ảnh + Mask) trên tập Train.
+Dữ liệu đầu vào (tải từ DatasetNinja, định dạng Supervisely):
+
+    kolektorsdd2-DatasetNinja/                 magnetic-tile-surface-defect-DatasetNinja/
+    ├── meta.json                              ├── meta.json
+    ├── train/{img, ann}                       └── ds/{img, ann}      (KHÔNG chia sẵn train/test)
+    └── test/{img, ann}
+
+  * Ảnh `img/<tên>.<ext>` đi cặp với `ann/<tên>.<ext>.json`.
+  * Ann JSON có `size {height, width}` và `objects[]`; mỗi object là một `bitmap`
+    (chuỗi base64 của PNG nén zlib + `origin [x, y]`). `objects == []` => ảnh sạch (negative).
+  * KSDD2 có 1 lớp ("defect"); Magnetic Tile có 5 lớp (blowhole, break, crack, fray, uneven).
+
+Đầu ra (data_segmentation/):
+
+    data_segmentation/
+    ├── train/{ann, img, masks_png}
+    ├── val/{ann, img, masks_png}
+    └── test/{ann, img, masks_png}
+
+  * `ann/`        : bản sao ann JSON gốc (đổi tên theo sample_id).
+  * `img/`        : ảnh gốc, đổi tên theo sample_id (`ksdd2_<id>` / `mt_<id>`).
+  * `masks_png/`  : mask nhị phân 0/255 (L-mode), cùng kích thước ảnh, giải mã từ ann.
+
+Các thành phần chính:
+  1. Giải mã mask Supervisely (bitmap + polygon)     -> `ann_to_mask`
+  2. Kiểm toán cặp ảnh–ann–mask                       -> `scan_dataset`
+  3. Phân loại khuyết tật Small / Medium / Large      -> `classify_size`
+  4. Chia Train/Val/Test phân tầng                    -> `assign_splits`
+  5. Xuất dataset + kiểm tra lại sau khi xuất        -> `export_dataset`, `verify_export`
+  6. Augmentation đồng bộ ảnh+mask (online)           -> `CoupledAugmentor`
+  7. Boundary map cho Boundary-Aware Loss             -> `extract_boundary`
+  8. PyTorch Dataset                                  -> `SurfaceDefectDataset`
 """
 
-import os
-import json
-import shutil
-import random
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
+from __future__ import annotations
 
+import base64
+import io
+import json
+import random
+import shutil
+import zlib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import cv2
 import numpy as np
+import pandas as pd
 from PIL import Image, ImageDraw
 
 try:
-    import cv2
-    HAS_CV2 = True
-except ImportError:
-    HAS_CV2 = False
-
-try:
     import torch
-    from torch.utils.data import Dataset
+    from torch.utils.data import Dataset as _TorchDataset
     HAS_TORCH = True
-except ImportError:
+except ImportError:  # vẫn chạy được EDA khi chưa cài torch
+    torch = None
+    _TorchDataset = object
     HAS_TORCH = False
-    class Dataset:
-        pass
 
 
 # ==============================================================================
-# 1. ĐỊNH NGHĨA CẤU TRÚC DỮ LIỆU
+# 0. HẰNG SỐ
+# ==============================================================================
+
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+SPLITS = ("train", "val", "test")
+
+# Định nghĩa Small / Medium / Large theo DIỆN TÍCH KHUYẾT TẬT (pixel², tổng các vùng lỗi trong ảnh).
+#   Small  : area <  1 024 px²
+#   Medium : 1 024 <= area <= 4 096 px²
+#   Large  : area >  4 096 px²
+# Có thể đổi tại đây; EDA (biểu đồ ECDF) cho thấy các ngưỡng này nằm ở đâu trên phân phối thực.
+SMALL_MAX_PX = 1024
+MEDIUM_MAX_PX = 4096
+SIZE_ORDER = ["Small", "Medium", "Large"]
+NEGATIVE_LABEL = "Negative"
+
+
+def classify_size(area_px: int) -> str:
+    """Phân loại quy mô khuyết tật theo tổng diện tích (px²)."""
+    if area_px <= 0:
+        return NEGATIVE_LABEL
+    if area_px < SMALL_MAX_PX:
+        return "Small"
+    if area_px <= MEDIUM_MAX_PX:
+        return "Medium"
+    return "Large"
+
+
+# ==============================================================================
+# 1. GIẢI MÃ ANN SUPERVISELY -> MASK NHỊ PHÂN
+# ==============================================================================
+
+def decode_bitmap(b64_data: str) -> np.ndarray:
+    """
+    Giải mã `bitmap.data` của Supervisely: base64 -> zlib -> PNG -> mảng bool (h, w).
+    (Đã kiểm chứng trên mẫu thật: PNG mode 'P' với giá trị {0, 1}.)
+    """
+    raw = zlib.decompress(base64.b64decode(b64_data))
+    with Image.open(io.BytesIO(raw)) as im:
+        if im.mode in ("RGBA", "LA"):
+            arr = np.array(im.getchannel("A"))
+        else:
+            arr = np.array(im.convert("L"))
+    return arr > 0
+
+
+def _polygon_to_mask(points: dict, h: int, w: int) -> np.ndarray:
+    """Polygon Supervisely: {"exterior": [[x, y], ...], "interior": [[[x, y], ...], ...]}."""
+    canvas = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(canvas)
+    ext = points.get("exterior", [])
+    if len(ext) >= 3:
+        draw.polygon([tuple(p) for p in ext], fill=1)
+    for hole in points.get("interior", []):
+        if len(hole) >= 3:
+            draw.polygon([tuple(p) for p in hole], fill=0)
+    return np.array(canvas, dtype=bool)
+
+
+def ann_to_mask(ann: dict, img_w: Optional[int] = None, img_h: Optional[int] = None
+                ) -> Tuple[np.ndarray, dict]:
+    """
+    Dựng mask nhị phân (uint8 0/255) kích thước (h, w) từ một ann Supervisely.
+
+    Trả về (mask, info) với info:
+        classes       : list tên lớp xuất hiện (đã loại trùng, giữ thứ tự)
+        class_pixels  : {tên lớp: số pixel mask của lớp đó} (object chồng nhau bị đếm lặp)
+        num_objects   : số object trong ann
+        issues        : list mã lỗi (BITMAP_OUT_OF_BOUNDS, EMPTY_OBJECT_MASK, UNSUPPORTED_GEOMETRY, BAD_BITMAP)
+    Kích thước canvas lấy từ `ann["size"]` (nếu thiếu thì dùng img_w/img_h).
+    """
+    size = ann.get("size", {})
+    h = int(size.get("height", img_h or 0))
+    w = int(size.get("width", img_w or 0))
+    canvas = np.zeros((h, w), dtype=bool)
+    info = {"classes": [], "class_pixels": {}, "num_objects": 0, "issues": []}
+
+    for obj in ann.get("objects", []):
+        info["num_objects"] += 1
+        title = obj.get("classTitle", "defect")
+        gtype = obj.get("geometryType")
+        obj_mask = np.zeros((h, w), dtype=bool)
+
+        if gtype == "bitmap":
+            try:
+                bm = decode_bitmap(obj["bitmap"]["data"])
+            except Exception:
+                info["issues"].append("BAD_BITMAP")
+                continue
+            ox, oy = obj["bitmap"].get("origin", [0, 0])
+            bh, bw = bm.shape
+            y1, x1 = min(h, oy + bh), min(w, ox + bw)
+            if ox < 0 or oy < 0 or oy + bh > h or ox + bw > w:
+                info["issues"].append("BITMAP_OUT_OF_BOUNDS")
+            if ox >= 0 and oy >= 0 and y1 > oy and x1 > ox:
+                obj_mask[oy:y1, ox:x1] = bm[: y1 - oy, : x1 - ox]
+        elif gtype == "polygon":
+            obj_mask = _polygon_to_mask(obj.get("points", {}), h, w)
+        else:
+            info["issues"].append("UNSUPPORTED_GEOMETRY")
+            continue
+
+        px = int(obj_mask.sum())
+        if px == 0:
+            info["issues"].append("EMPTY_OBJECT_MASK")
+        if title not in info["classes"]:
+            info["classes"].append(title)
+        info["class_pixels"][title] = info["class_pixels"].get(title, 0) + px
+        canvas |= obj_mask
+
+    info["issues"] = sorted(set(info["issues"]))
+    return canvas.astype(np.uint8) * 255, info
+
+
+def ann_path_for(img_path: Path) -> Path:
+    """`img/<tên>.<ext>` -> `ann/<tên>.<ext>.json` (quy ước Supervisely)."""
+    return img_path.parent.parent / "ann" / (img_path.name + ".json")
+
+
+# ==============================================================================
+# 2. BOUNDARY MAP + THỐNG KÊ MASK
+# ==============================================================================
+
+def extract_boundary(mask: np.ndarray, thickness: int = 1) -> np.ndarray:
+    """
+    Bản đồ ranh giới cho Boundary-Aware Loss: morphological gradient = dilate(M) - erode(M).
+    Trả về uint8 0/255 cùng kích thước mask.
+    """
+    m = (mask > 0).astype(np.uint8) * 255
+    if not m.any():
+        return np.zeros_like(m)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * thickness + 1, 2 * thickness + 1))
+    return cv2.subtract(cv2.dilate(m, k), cv2.erode(m, k))
+
+
+def analyze_mask(mask: np.ndarray) -> dict:
+    """Diện tích, số vùng liên thông (8-neighbour), vùng lớn nhất, chu vi, bbox của mask."""
+    binary = (mask > 0).astype(np.uint8)
+    area = int(binary.sum())
+    if area == 0:
+        return dict(area_px=0, num_components=0, largest_component_px=0,
+                    component_areas=[], perimeter_px=0.0, bbox=None)
+    _, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    comp_areas = sorted((int(a) for a in stats[1:, cv2.CC_STAT_AREA]), reverse=True)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    perimeter = float(sum(cv2.arcLength(c, True) for c in contours))
+    ys, xs = np.where(binary)
+    return dict(area_px=area, num_components=len(comp_areas), largest_component_px=comp_areas[0],
+                component_areas=comp_areas, perimeter_px=round(perimeter, 2),
+                bbox=(int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())))
+
+
+# ==============================================================================
+# 3. CẤU TRÚC DỮ LIỆU + KIỂM TOÁN
 # ==============================================================================
 
 @dataclass
-class DefectPolygonShape:
-    label: str
-    points: List[List[float]]   # [[x1, y1], [x2, y2], ...]
-    area_pixels: int
-    category: str               # 'Small', 'Medium', 'Large'
+class DatasetSpec:
+    name: str                      # "KolektorSDD2" | "MagneticTile"
+    prefix: str                    # "ksdd2" | "mt"
+    root: Path
+    subsets: Dict[str, Path]       # {split gốc: thư mục chứa img/ và ann/}
+    known_classes: List[str] = field(default_factory=list)
 
 
-@dataclass
-class DefectSegmentationInfo:
-    total_area_pixels: int
-    relative_area_pct: float
-    category: str
-    num_components: int
-    boundary_perimeter_px: float
-    shapes: List[DefectPolygonShape] = field(default_factory=list)
+def make_ksdd2_spec(root: Path) -> DatasetSpec:
+    root = Path(root)
+    return DatasetSpec("KolektorSDD2", "ksdd2", root,
+                       {s: root / s for s in ("train", "test") if (root / s / "img").is_dir()},
+                       _read_meta_classes(root))
+
+
+def make_mt_spec(root: Path) -> DatasetSpec:
+    root = Path(root)
+    subsets = {}
+    for cand in (root / "ds", root):
+        if (cand / "img").is_dir():
+            subsets["all"] = cand      # Magnetic Tile gốc không chia train/test
+            break
+    return DatasetSpec("MagneticTile", "mt", root, subsets, _read_meta_classes(root))
+
+
+def _read_meta_classes(root: Path) -> List[str]:
+    try:
+        with open(Path(root) / "meta.json", encoding="utf-8") as f:
+            return [c["title"] for c in json.load(f).get("classes", [])]
+    except Exception:
+        return []
 
 
 @dataclass
 class SampleRecord:
     sample_id: str
-    dataset_source: str          # 'KolektorSDD2' hoặc 'MagneticTile'
-    image_path: Path
-    mask_path: Optional[Path]
+    source: str
+    orig_split: str                # split gốc trong dataset ("train" | "test" | "all")
+    img_path: Path
+    ann_path: Path
     width: int
     height: int
+    ann_width: int
+    ann_height: int
     channels: int
     aspect_ratio: float
-    has_defect: bool
-    defect_info: DefectSegmentationInfo
-    image_hash: Optional[np.ndarray] = None
-    split: str = "train"
-    integrity_status: str = "OK"
+    is_positive: bool
+    classes: List[str]
+    primary_class: str             # lớp có nhiều pixel nhất ("none" nếu ảnh sạch)
+    class_pixels: Dict[str, int]
+    num_objects: int
+    area_px: int
+    rel_area_pct: float
+    num_components: int
+    largest_component_px: int
+    component_areas: List[int]
+    size_category: str             # Small | Medium | Large | Negative
+    perimeter_px: float
+    bbox: Optional[Tuple[int, int, int, int]]
+    issues: List[str]
+    split: str = ""                # train | val | test (gán bởi assign_splits)
+
+    @property
+    def integrity_status(self) -> str:
+        return "OK" if not self.issues else ";".join(self.issues)
 
 
-# ==============================================================================
-# 2. XỬ LÝ MASK LABELME JSON (POLYGON CONVERTER & METADATA AUDITOR)
-# ==============================================================================
-
-class LabelMeJsonConverter:
+def scan_dataset(spec: DatasetSpec) -> Tuple[List[SampleRecord], dict]:
     """
-    Chuyển đổi hai chiều giữa Mask nhị phân (Binary Mask) và định dạng LabelMe JSON.
-    Hỗ trợ kiểm tra metadata trong file JSON để xác định mẫu có lỗi (Defect).
+    Kiểm toán toàn bộ một dataset: ghép ảnh–ann, giải mã mask, đo diện tích, kiểm tra toàn vẹn.
+
+    Trả về (records, report). `report` gồm:
+        n_images, n_ann_files, missing_ann, orphan_ann, corrupt_images, bad_ann_json, id_collisions
+    Mẫu thiếu ann / ảnh hỏng / ann hỏng bị loại khỏi `records` (vì không có nhãn đáng tin).
+    Các lỗi còn lại (SIZE_MISMATCH, BITMAP_OUT_OF_BOUNDS, ...) vẫn giữ mẫu và ghi vào `issues`.
     """
-    @staticmethod
-    def mask_to_polygons(mask_np: np.ndarray, min_area: int = 4) -> List[List[List[float]]]:
-        """
-        Trích xuất các tọa độ đa giác (Polygon points) từ ảnh mask nhị phân.
-        """
-        binary = (mask_np > 127).astype(np.uint8)
-        if np.sum(binary) == 0:
-            return []
+    records: List[SampleRecord] = []
+    report = dict(n_images=0, n_ann_files=0, missing_ann=[], orphan_ann=[],
+                  corrupt_images=[], bad_ann_json=[], id_collisions=0)
+    seen_ids = set()
 
-        polygons = []
-        if HAS_CV2:
-            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area < min_area:
-                    continue
-                # Giảm độ răng cưa polygon bằng approxPolyDP
-                epsilon = 0.005 * cv2.arcLength(cnt, True)
-                approx = cv2.approxPolyDP(cnt, epsilon, True)
-                pts = approx.reshape(-1, 2)
-                if len(pts) >= 3:
-                    polygons.append([[round(float(x), 2), round(float(y), 2)] for x, y in pts])
-        else:
-            from scipy import ndimage
-            labeled, n_features = ndimage.label(binary)
-            for i in range(1, n_features + 1):
-                comp = (labeled == i)
-                area = np.sum(comp)
-                if area < min_area:
-                    continue
-                rows = np.any(comp, axis=1)
-                cols = np.any(comp, axis=0)
-                ymin, ymax = np.where(rows)[0][[0, -1]]
-                xmin, xmax = np.where(cols)[0][[0, -1]]
-                polygons.append([
-                    [float(xmin), float(ymin)], [float(xmax), float(ymin)],
-                    [float(xmax), float(ymax)], [float(xmin), float(ymax)]
-                ])
+    for orig_split, sub_root in spec.subsets.items():
+        img_dir, ann_dir = sub_root / "img", sub_root / "ann"
+        img_files = sorted(p for p in img_dir.iterdir() if p.suffix.lower() in IMG_EXTS)
+        ann_files = sorted(ann_dir.glob("*.json")) if ann_dir.is_dir() else []
+        report["n_images"] += len(img_files)
+        report["n_ann_files"] += len(ann_files)
 
-        return polygons
+        img_names = {p.name for p in img_files}
+        report["orphan_ann"] += [str(a.relative_to(spec.root)) for a in ann_files
+                                 if a.name[:-5] not in img_names]
 
-    @classmethod
-    def create_labelme_json(cls, image_filename: str, img_w: int, img_h: int,
-                            polygons: List[List[List[float]]], label: str = "defect") -> dict:
-        """
-        Tạo cấu trúc dict chuẩn định dạng LabelMe JSON.
-        """
-        shapes = []
-        for poly in polygons:
-            shapes.append({
-                "label": label,
-                "points": poly,
-                "group_id": None,
-                "description": "",
-                "shape_type": "polygon",
-                "flags": {},
-                "mask": None
-            })
+        for img_path in img_files:
+            ann_path = ann_dir / (img_path.name + ".json")
+            if not ann_path.exists():
+                report["missing_ann"].append(str(img_path.relative_to(spec.root)))
+                continue
+            try:
+                with Image.open(img_path) as im:
+                    im.load()
+                    w, h = im.size
+                    channels = len(im.getbands())
+            except Exception:
+                report["corrupt_images"].append(str(img_path.relative_to(spec.root)))
+                continue
+            try:
+                with open(ann_path, encoding="utf-8") as f:
+                    ann = json.load(f)
+                mask, info = ann_to_mask(ann, w, h)
+            except Exception:
+                report["bad_ann_json"].append(str(ann_path.relative_to(spec.root)))
+                continue
 
-        return {
-            "version": "5.2.1",
-            "flags": {},
-            "shapes": shapes,
-            "imagePath": image_filename,
-            "imageData": None,
-            "imageHeight": int(img_h),
-            "imageWidth": int(img_w)
-        }
+            issues = list(info["issues"])
+            aw, ah = int(ann["size"]["width"]), int(ann["size"]["height"])
+            if (aw, ah) != (w, h):
+                issues.append("SIZE_MISMATCH")
+            for c in info["classes"]:
+                if spec.known_classes and c not in spec.known_classes:
+                    issues.append("UNKNOWN_CLASS")
+            if info["num_objects"] > 0 and not mask.any():
+                issues.append("ALL_OBJECTS_EMPTY")
 
-    @staticmethod
-    def json_to_mask(json_data: dict, img_w: int, img_h: int) -> np.ndarray:
-        """
-        Tái tạo mặt nạ nhị phân numpy array (0 và 255) từ dữ liệu LabelMe JSON.
-        """
-        mask_img = Image.new('L', (img_w, img_h), 0)
-        draw = ImageDraw.Draw(mask_img)
+            st = analyze_mask(mask)
+            sample_id = f"{spec.prefix}_{img_path.stem}"
+            if sample_id in seen_ids:
+                report["id_collisions"] += 1
+                sample_id = f"{spec.prefix}_{orig_split}_{img_path.stem}"
+            seen_ids.add(sample_id)
 
-        for shape in json_data.get("shapes", []):
-            pts = shape.get("points", [])
-            if len(pts) >= 3:
-                flat_pts = [(p[0], p[1]) for p in pts]
-                draw.polygon(flat_pts, outline=255, fill=255)
-
-        return np.array(mask_img, dtype=np.uint8)
-
-    @classmethod
-    def is_defect_json(cls, json_path: Path) -> bool:
-        """
-        Kiểm tra metadata trong file JSON: trả về True nếu có ít nhất 1 shape mang nhãn 'defect'.
-        """
-        try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            shapes = data.get("shapes", [])
-            for s in shapes:
-                lbl = str(s.get("label", "")).lower()
-                pts = s.get("points", [])
-                if "defect" in lbl and len(pts) >= 3:
-                    return True
-            return False
-        except Exception:
-            return False
-
-
-# ==============================================================================
-# 3. BOUNDARY EXTRACTOR (HỖ TRỢ BOUNDARY-AWARE LOSS)
-# ==============================================================================
-
-class BoundaryExtractor:
-    @staticmethod
-    def extract_boundary(mask_binary: np.ndarray, thickness: int = 1) -> np.ndarray:
-        """
-        Trích xuất bản đồ ranh giới/đường biên: Boundary = Dilation(M) - Erosion(M).
-        """
-        mask_u8 = (mask_binary > 0).astype(np.uint8) * 255
-        if np.sum(mask_u8) == 0:
-            return np.zeros_like(mask_u8)
-
-        if HAS_CV2:
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (thickness * 2 + 1, thickness * 2 + 1))
-            dilated = cv2.dilate(mask_u8, kernel)
-            eroded = cv2.erode(mask_u8, kernel)
-            return cv2.subtract(dilated, eroded)
-        else:
-            from scipy import ndimage
-            struct = ndimage.generate_binary_structure(2, 1)
-            dilated = ndimage.binary_dilation(mask_u8 > 0, structure=struct, iterations=thickness)
-            eroded = ndimage.binary_erosion(mask_u8 > 0, structure=struct, iterations=thickness)
-            return (dilated ^ eroded).astype(np.uint8) * 255
-
-    @staticmethod
-    def calculate_perimeter(mask_binary: np.ndarray) -> float:
-        if np.sum(mask_binary) == 0:
-            return 0.0
-        if HAS_CV2:
-            contours, _ = cv2.findContours((mask_binary > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            return float(sum(cv2.arcLength(c, True) for c in contours))
-        else:
-            boundary = BoundaryExtractor.extract_boundary(mask_binary)
-            return float(np.count_nonzero(boundary > 0))
-
-
-# ==============================================================================
-# 4. DEFECT SIZE ANALYZER (ĐỊNH NGHĨA KHUYẾT TẬT NHỎ CHO SEGMENTATION)
-# ==============================================================================
-
-class DefectSizeAnalyzer:
-    SMALL_THRESH_PX = 1024       # < 1,024 px² (hoặc < 0.5% diện tích)
-    MEDIUM_THRESH_PX = 4096      # 1,024 ~ 4,096 px²
-
-    @classmethod
-    def classify_defect(cls, area_px: int) -> str:
-        if area_px == 0:
-            return "None"
-        if area_px < cls.SMALL_THRESH_PX:
-            return "Small"
-        elif area_px <= cls.MEDIUM_THRESH_PX:
-            return "Medium"
-        else:
-            return "Large"
-
-    @classmethod
-    def analyze_mask(cls, mask_np: np.ndarray, img_w: int, img_h: int) -> DefectSegmentationInfo:
-        binary = (mask_np > 127).astype(np.uint8)
-        area_px = int(np.count_nonzero(binary))
-        img_area = float(img_w * img_h)
-        rel_pct = round((area_px / img_area) * 100.0, 4) if img_area > 0 else 0.0
-
-        if area_px == 0:
-            return DefectSegmentationInfo(
-                total_area_pixels=0, relative_area_pct=0.0,
-                category="None", num_components=0, boundary_perimeter_px=0.0, shapes=[]
-            )
-
-        # Trích xuất polygons cho LabelMe JSON
-        polys = LabelMeJsonConverter.mask_to_polygons(mask_np)
-        shapes = []
-        for poly in polys:
-            p_area = 0
-            if HAS_CV2:
-                p_area = int(cv2.contourArea(np.array(poly, dtype=np.float32)))
-            shapes.append(DefectPolygonShape(
-                label="defect", points=poly, area_pixels=p_area,
-                category=cls.classify_defect(p_area)
+            primary = (max(info["class_pixels"], key=info["class_pixels"].get)
+                       if info["class_pixels"] and st["area_px"] > 0 else "none")
+            records.append(SampleRecord(
+                sample_id=sample_id, source=spec.name, orig_split=orig_split,
+                img_path=img_path, ann_path=ann_path, width=w, height=h,
+                ann_width=aw, ann_height=ah, channels=channels,
+                aspect_ratio=round(w / h, 4) if h else 1.0,
+                is_positive=st["area_px"] > 0, classes=info["classes"], primary_class=primary,
+                class_pixels=info["class_pixels"], num_objects=info["num_objects"],
+                area_px=st["area_px"], rel_area_pct=round(100.0 * st["area_px"] / (w * h), 4),
+                num_components=st["num_components"], largest_component_px=st["largest_component_px"],
+                component_areas=st["component_areas"], size_category=classify_size(st["area_px"]),
+                perimeter_px=st["perimeter_px"], bbox=st["bbox"],
+                issues=sorted(set(issues)),
             ))
-
-        num_components = max(1, len(polys))
-        perimeter = BoundaryExtractor.calculate_perimeter(binary)
-        cat = cls.classify_defect(area_px)
-
-        return DefectSegmentationInfo(
-            total_area_pixels=area_px,
-            relative_area_pct=rel_pct,
-            category=cat,
-            num_components=num_components,
-            boundary_perimeter_px=round(perimeter, 2),
-            shapes=shapes
-        )
+    return records, report
 
 
-# ==============================================================================
-# 5. DATASET AUDITOR (KIỂM TOÁN TÍNH TOÀN VẸN & LỌC CHỈ MẪU CÓ DEFECT)
-# ==============================================================================
-
-class DatasetAuditor:
-    @staticmethod
-    def audit_sample(img_path: Path, mask_path: Optional[Path], dataset_name: str,
-                     sample_id: str, defect_only: bool = True) -> Optional[SampleRecord]:
-        """
-        Kiểm toán và trả về SampleRecord.
-        Nếu defect_only == True, loại bỏ hoàn toàn các ảnh sạch (không có khuyết tật).
-        """
+def records_to_dataframe(records: Sequence[SampleRecord], base_dir: Optional[Path] = None) -> pd.DataFrame:
+    """Bảng thống kê -> dataset_statistics.csv (đường dẫn quy về tương đối so với base_dir)."""
+    def rel(p: Path) -> str:
         try:
-            with Image.open(img_path) as img:
-                w, h = img.size
-                channels = len(img.mode) if img.mode in ['RGB', 'RGBA'] else 1
-                aspect_ratio = round(w / float(h), 4) if h > 0 else 1.0
-        except Exception:
-            return None
+            return p.relative_to(base_dir).as_posix() if base_dir else p.as_posix()
+        except ValueError:
+            return p.as_posix()
 
-        if mask_path is None or not mask_path.exists():
-            if defect_only:
-                return None
-            empty_info = DefectSegmentationInfo(0, 0.0, "None", 0, 0.0, [])
-            return SampleRecord(
-                sample_id=sample_id, dataset_source=dataset_name,
-                image_path=img_path, mask_path=None,
-                width=w, height=h, channels=channels, aspect_ratio=aspect_ratio,
-                has_defect=False, defect_info=empty_info,
-                integrity_status="MISSING_MASK"
-            )
+    rows = []
+    for r in records:
+        rows.append({
+            "sample_id": r.sample_id, "dataset_source": r.source,
+            "orig_split": r.orig_split, "split": r.split,
+            "img_path": rel(r.img_path), "ann_path": rel(r.ann_path),
+            "width": r.width, "height": r.height, "ann_width": r.ann_width, "ann_height": r.ann_height,
+            "channels": r.channels, "aspect_ratio": r.aspect_ratio,
+            "is_positive": r.is_positive, "num_objects": r.num_objects,
+            "classes": "|".join(r.classes) if r.classes else "none", "primary_class": r.primary_class,
+            "defect_area_px": r.area_px, "relative_defect_area_pct": r.rel_area_pct,
+            "num_components": r.num_components, "largest_component_px": r.largest_component_px,
+            "component_areas": ";".join(map(str, r.component_areas)),
+            "size_category": r.size_category, "boundary_perimeter_px": r.perimeter_px,
+            "bbox_x1": r.bbox[0] if r.bbox else "", "bbox_y1": r.bbox[1] if r.bbox else "",
+            "bbox_x2": r.bbox[2] if r.bbox else "", "bbox_y2": r.bbox[3] if r.bbox else "",
+            "integrity_status": r.integrity_status,
+        })
+    return pd.DataFrame(rows)
 
-        try:
-            with Image.open(mask_path) as m_img:
-                mw, mh = m_img.size
-                status = "OK" if (mw == w and mh == h) else f"DIM_MISMATCH (Img:{w}x{h} vs Mask:{mw}x{mh})"
-                mask_np = np.array(m_img.convert('L'))
-        except Exception:
-            return None
 
-        has_defect = (np.count_nonzero(mask_np > 127) > 0)
-        if defect_only and not has_defect:
-            return None  # LỌC BỎ ẢNH SẠCH
-
-        defect_info = DefectSizeAnalyzer.analyze_mask(mask_np, w, h)
-        if defect_only and defect_info.total_area_pixels == 0:
-            return None
-
-        return SampleRecord(
-            sample_id=sample_id, dataset_source=dataset_name,
-            image_path=img_path, mask_path=mask_path,
-            width=w, height=h, channels=channels, aspect_ratio=aspect_ratio,
-            has_defect=has_defect, defect_info=defect_info,
-            integrity_status=status
-        )
-
-    @classmethod
-    def scan_kolektor(cls, kolektor_dir: Path, defect_only: bool = True) -> List[SampleRecord]:
-        """
-        Quét KolektorSDD2.
-        Đồng nhất tiền tố: `ksdd2_defect_XXXX`
-        """
-        records = []
-        if not kolektor_dir.exists():
-            return records
-
-        count = 1
-        for split_folder in ["train", "test"]:
-            dir_path = kolektor_dir / split_folder
-            if not dir_path.exists():
-                continue
-            for img_file in sorted(dir_path.glob("*.png")):
-                if img_file.stem.endswith("_GT"):
-                    continue
-                mask_file = dir_path / f"{img_file.stem}_GT.png"
-                rec = cls.audit_sample(
-                    img_path=img_file,
-                    mask_path=mask_file if mask_file.exists() else None,
-                    dataset_name="KolektorSDD2",
-                    sample_id=f"ksdd2_defect_{count:04d}",
-                    defect_only=defect_only
-                )
-                if rec is not None:
-                    records.append(rec)
-                    count += 1
-        return records
-
-    @classmethod
-    def locate_magnetic_tile_dir(cls, base_dir: Path) -> Optional[Path]:
-        candidates = [
-            base_dir / "Magnetic-tile-defect-datasets.-master",
-            base_dir / "Magnetic-tile-defect-datasets-master",
-            base_dir / "Magnetic-tile-defect-datasets.",
-            base_dir / "Magnetic_Tile",
-            base_dir / "Magnetic-Tile-Defect"
-        ]
-        for p in candidates:
-            if p.exists() and p.is_dir():
-                return p
-        for p in base_dir.iterdir():
-            if p.is_dir() and "magnetic" in p.name.lower():
-                return p
-        return None
-
-    @classmethod
-    def scan_magnetic_tile(cls, mt_dir: Path, defect_only: bool = True) -> List[SampleRecord]:
-        """
-        Quét Magnetic Tile (Bỏ qua hoàn toàn thư mục MT_Free chứa ảnh sạch không lỗi).
-        Đồng nhất tiền tố: `mt_<defect_type>_defect_XXXX`
-        """
-        records = []
-        if not mt_dir.exists():
-            return records
-
-        image_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
-        all_files = sorted(list(mt_dir.rglob("*")))
-        count = 1
-
-        for item in all_files:
-            if not item.is_file() or item.suffix.lower() not in image_extensions:
-                continue
-            if item.name.lower() in ["dataset.jpg", "dataset.png", "sample.jpg", "readme.jpg"]:
-                continue
-            if "_gt" in item.name.lower() or "mask" in str(item.parent).lower():
-                continue
-
-            # Bỏ qua hoàn toàn thư mục MT_Free (ảnh sạch không lỗi)
-            if any(k in item.parts for k in ["MT_Free", "Free", "free", "normal"]):
-                continue
-
-            # Xác định loại khuyết tật từ thư mục cha (ví dụ: MT_Blowhole -> blowhole)
-            def_type = "defect"
-            for part in item.parts:
-                if part.startswith("MT_") and part != "MT_Free":
-                    def_type = part.replace("MT_", "").lower()
-                    break
-
-            # Tìm mask tương ứng (.png cùng tên)
-            parent = item.parent
-            stem = item.stem
-            mask_file = None
-            for cand in [parent / f"{stem}.png", parent / f"{stem}_GT.png"]:
-                if cand.exists() and cand != item:
-                    mask_file = cand
-                    break
-
-            if item.suffix.lower() == ".png" and (item.parent / f"{item.stem}.jpg").exists():
-                continue
-
-            rec = cls.audit_sample(
-                img_path=item,
-                mask_path=mask_file,
-                dataset_name="MagneticTile",
-                sample_id=f"mt_{def_type}_defect_{count:04d}",
-                defect_only=defect_only
-            )
-            if rec is not None:
-                records.append(rec)
-                count += 1
-        return records
+def components_dataframe(records: Sequence[SampleRecord]) -> pd.DataFrame:
+    """Mỗi dòng = một vùng lỗi liên thông (dùng cho phân tích kích thước ở mức từng khuyết tật)."""
+    rows = [{"sample_id": r.sample_id, "dataset_source": r.source, "component_area_px": a,
+             "size_category": classify_size(a)}
+            for r in records for a in r.component_areas]
+    return pd.DataFrame(rows, columns=["sample_id", "dataset_source", "component_area_px", "size_category"])
 
 
 # ==============================================================================
-# 6. IMAGE HASHING & DEDUPLICATION (256-BIT DHASH INTRA-DATASET)
+# 4. KIỂM TRA TRÙNG LẶP GẦN GIỐNG (dHash) — phát hiện rò rỉ dữ liệu giữa các split
 # ==============================================================================
 
-class ImageHasher:
-    @staticmethod
-    def compute_dhash(img: Image.Image, hash_size: int = 16) -> np.ndarray:
-        resized = img.convert('L').resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
-        pixels = np.array(resized, dtype=np.int16)
-        diff = pixels[:, 1:] > pixels[:, :-1]
-        return diff.flatten()
-
-    @classmethod
-    def deduplicate(cls, samples: List[SampleRecord], threshold: int = 2) -> Tuple[List[SampleRecord], Dict[str, int]]:
-        unique_samples: List[SampleRecord] = []
-        dup_stats: Dict[str, int] = {}
-
-        for sample in samples:
-            if sample.image_hash is None:
-                try:
-                    with Image.open(sample.image_path) as img:
-                        sample.image_hash = cls.compute_dhash(img, hash_size=16)
-                except Exception:
-                    pass
-
-        sources = sorted(list(set(s.dataset_source for s in samples)))
-        for src in sources:
-            src_samples = [s for s in samples if s.dataset_source == src]
-            src_unique: List[SampleRecord] = []
-            src_dups = 0
-
-            hashes = []
-            for s in src_samples:
-                if s.image_hash is None:
-                    src_unique.append(s)
-                    continue
-                if not hashes:
-                    hashes.append(s.image_hash)
-                    src_unique.append(s)
-                    continue
-                u_stack = np.array(hashes)
-                dists = np.count_nonzero(u_stack != s.image_hash, axis=1)
-                if np.any(dists <= threshold):
-                    src_dups += 1
-                else:
-                    hashes.append(s.image_hash)
-                    src_unique.append(s)
-
-            unique_samples.extend(src_unique)
-            dup_stats[src] = src_dups
-
-        return unique_samples, dup_stats
+def dhash(path: Path, hash_size: int = 16) -> np.ndarray:
+    with Image.open(path) as im:
+        g = im.convert("L").resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
+    a = np.asarray(g, dtype=np.int16)
+    return (a[:, 1:] > a[:, :-1]).flatten()
 
 
-# ==============================================================================
-# 7. COUPLED SEGMENTATION AUGMENTATION (TĂNG CƯỜNG ĐỒNG BỘ ẢNH + MASK)
-# ==============================================================================
-
-class CoupledSegmentationAugmentor:
+def find_near_duplicates(records: Sequence[SampleRecord], max_hamming: int = 2) -> List[Tuple[str, str, int]]:
     """
-    Tăng cường dữ liệu đồng bộ (Coupled Augmentation):
-    Áp dụng phép biến đổi hình học (Lật ngang, lật dọc, xoay 90 độ)
-    đồng thời trên cả Ảnh và Mask nhị phân để bảo toàn tính toàn vẹn 100% của nhãn.
-    Chỉ áp dụng trên tập Train.
+    Tìm cặp ảnh gần trùng (khoảng cách Hamming dHash-256 <= max_hamming) TRONG CÙNG nguồn.
+    Chỉ báo cáo, không tự xóa. Trả về list (id_a, id_b, khoảng cách).
     """
-    @staticmethod
-    def augment(image: Image.Image, mask: Image.Image) -> List[Tuple[Image.Image, Image.Image, str]]:
-        augmented_pairs = []
-
-        # 1. Lật ngang (Horizontal Flip)
-        img_hf = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        mask_hf = mask.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        augmented_pairs.append((img_hf, mask_hf, "hflip"))
-
-        # 2. Lật dọc (Vertical Flip)
-        img_vf = image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-        mask_vf = mask.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-        augmented_pairs.append((img_vf, mask_vf, "vflip"))
-
-        # 3. Xoay 90 độ (Rotate 90)
-        img_r90 = image.transpose(Image.Transpose.ROTATE_90)
-        mask_r90 = mask.transpose(Image.Transpose.ROTATE_90)
-        augmented_pairs.append((img_r90, mask_r90, "rot90"))
-
-        return augmented_pairs
+    pairs: List[Tuple[str, str, int]] = []
+    for src in sorted({r.source for r in records}):
+        recs = [r for r in records if r.source == src]
+        H = np.stack([dhash(r.img_path) for r in recs]).astype(np.float32)
+        agree = H @ H.T + (1 - H) @ (1 - H).T
+        dist = H.shape[1] - agree
+        iu, ju = np.where(np.triu(dist <= max_hamming, k=1))
+        pairs += [(recs[i].sample_id, recs[j].sample_id, int(dist[i, j])) for i, j in zip(iu, ju)]
+    return pairs
 
 
 # ==============================================================================
-# 8. STRATIFIED SPLITTER & DATASET EXPORTER
+# 5. CHIA TRAIN / VAL / TEST PHÂN TẦNG
 # ==============================================================================
 
-class DatasetSplitter:
-    @staticmethod
-    def split(samples: List[SampleRecord], train_r: float = 0.7, val_r: float = 0.15,
-              test_r: float = 0.15, seed: int = 42) -> None:
-        random.seed(seed)
-        groups: Dict[Tuple[str, str], List[SampleRecord]] = {}
-        for s in samples:
-            # Phân tầng theo (nguồn, nhóm quy mô khuyết tật)
-            key = (s.dataset_source, s.defect_info.category)
-            groups.setdefault(key, []).append(s)
-
-        for key, grp in groups.items():
-            random.shuffle(grp)
-            n_total = len(grp)
-            n_train = int(n_total * train_r)
-            n_val = int(n_total * val_r)
-
-            for i, s in enumerate(grp):
-                if i < n_train:
-                    s.split = "train"
-                elif i < n_train + n_val:
-                    s.split = "val"
-                else:
-                    s.split = "test"
-
-
-class LabelMeDatasetExporter:
+def _stratified_assign(recs: List[SampleRecord], fractions: Dict[str, float], rng: random.Random) -> None:
     """
-    Xuất bộ dữ liệu ra cấu trúc phân vùng chuẩn Semantic Segmentation:
-    data_segmentation/
-    ├── train/
-    │   ├── images/       (ksdd2_defect_0001.png, mt_blowhole_defect_0001.png)
-    │   ├── masks/        (ksdd2_defect_0001.json - chuẩn LabelMe)
-    │   └── masks_png/    (ksdd2_defect_0001.png - mask nhị phân tiện nạp PyTorch DataLoader)
-    ├── val/
-    │   ├── images/
-    │   ├── masks/        (file .json)
-    │   └── masks_png/    (file .png)
-    └── test/
-        ├── images/
-        ├── masks/        (file .json)
-        └── masks_png/    (file .png)
+    Chia phân tầng theo (nguồn, positive/negative, nhóm kích thước, lớp chính).
+    Phần dư sau khi làm tròn được phân ngẫu nhiên theo xác suất tỷ lệ với phần lẻ,
+    nên tỷ lệ toàn cục vẫn bám sát mục tiêu dù có nhiều nhóm nhỏ.
     """
-    @staticmethod
-    def export(samples: List[SampleRecord], output_dir: Path, apply_train_aug: bool = True) -> Dict[str, int]:
-        if output_dir.exists():
-            shutil.rmtree(output_dir)
+    total = sum(fractions.values())
+    fr = {k: v / total for k, v in fractions.items()}
+    groups: Dict[tuple, List[SampleRecord]] = {}
+    for r in recs:
+        groups.setdefault((r.source, r.is_positive, r.size_category, r.primary_class), []).append(r)
 
-        counts = {"train": 0, "val": 0, "test": 0}
-        for sp in ["train", "val", "test"]:
-            (output_dir / sp / "images").mkdir(parents=True, exist_ok=True)
-            (output_dir / sp / "masks").mkdir(parents=True, exist_ok=True)
-            (output_dir / sp / "masks_png").mkdir(parents=True, exist_ok=True)
+    for key in sorted(groups, key=str):
+        grp = sorted(groups[key], key=lambda r: r.sample_id)
+        rng.shuffle(grp)
+        n = len(grp)
+        exact = {k: n * f for k, f in fr.items()}
+        count = {k: int(v) for k, v in exact.items()}
+        rest = n - sum(count.values())
+        remain = {k: exact[k] - count[k] for k in fr}
+        for _ in range(rest):
+            ks = [k for k in fr if remain[k] > 0] or list(fr)
+            pick = rng.choices(ks, weights=[remain[k] if remain[k] > 0 else 1 for k in ks])[0]
+            count[pick] += 1
+            remain[pick] = 0
+        i = 0
+        for k in fr:
+            for r in grp[i:i + count[k]]:
+                r.split = k
+            i += count[k]
 
-        for s in samples:
-            sp = s.split
-            img_filename = f"{s.sample_id}.png"
-            json_filename = f"{s.sample_id}.json"
 
-            img_target = output_dir / sp / "images" / img_filename
-            json_target = output_dir / sp / "masks" / json_filename
-            mask_png_target = output_dir / sp / "masks_png" / img_filename
-
-            # 1. Lưu ảnh gốc
-            with Image.open(s.image_path) as im:
-                orig_img = im.convert('RGB')
-                orig_img.save(img_target)
-
-            # 2. Tạo và lưu file LabelMe JSON
-            poly_points = [shape.points for shape in s.defect_info.shapes]
-            json_data = LabelMeJsonConverter.create_labelme_json(
-                image_filename=img_filename,
-                img_w=s.width, img_h=s.height,
-                polygons=poly_points, label="defect"
-            )
-            with open(json_target, "w", encoding="utf-8") as jf:
-                json.dump(json_data, jf, indent=2, ensure_ascii=False)
-
-            # 3. Lưu mask PNG song hành
-            if s.mask_path and s.mask_path.exists():
-                with Image.open(s.mask_path) as m_im:
-                    orig_mask = m_im.convert('L')
-                    orig_mask.save(mask_png_target)
-            else:
-                m_np = LabelMeJsonConverter.json_to_mask(json_data, s.width, s.height)
-                orig_mask = Image.fromarray(m_np)
-                orig_mask.save(mask_png_target)
-
-            counts[sp] += 1
-
-            # 4. Tăng cường dữ liệu đồng bộ (chỉ trên tập Train và mẫu có defect)
-            if apply_train_aug and sp == "train" and s.has_defect:
-                aug_pairs = CoupledSegmentationAugmentor.augment(orig_img, orig_mask)
-                for aug_img, aug_mask, aug_type in aug_pairs:
-                    aug_id = f"{s.sample_id}_{aug_type}"
-                    aug_img_name = f"{aug_id}.png"
-                    aug_json_name = f"{aug_id}.json"
-
-                    aug_img.save(output_dir / "train" / "images" / aug_img_name)
-                    aug_mask.save(output_dir / "train" / "masks_png" / aug_img_name)
-
-                    aug_mask_np = np.array(aug_mask)
-                    aug_polys = LabelMeJsonConverter.mask_to_polygons(aug_mask_np)
-                    aug_json_data = LabelMeJsonConverter.create_labelme_json(
-                        image_filename=aug_img_name,
-                        img_w=aug_img.width, img_h=aug_img.height,
-                        polygons=aug_polys, label="defect"
-                    )
-                    with open(output_dir / "train" / "masks" / aug_json_name, "w", encoding="utf-8") as jf:
-                        json.dump(aug_json_data, jf, indent=2, ensure_ascii=False)
-
-                    counts["train"] += 1
-
-        return counts
+def assign_splits(records: Sequence[SampleRecord], train_r: float = 0.70, val_r: float = 0.15,
+                  test_r: float = 0.15, seed: int = 42, respect_official: bool = True) -> None:
+    """
+    Gán `record.split` ∈ {train, val, test}.
+      * respect_official=True : giữ nguyên tập test chính thức của dataset (KSDD2),
+        tách val từ tập train chính thức với tỷ lệ val_r/(train_r+val_r).
+      * Dataset không có split gốc (Magnetic Tile: orig_split == "all") hoặc respect_official=False
+        => chia phân tầng 3 phần theo train_r/val_r/test_r.
+    """
+    rng = random.Random(seed)
+    train_val, three_way = [], []
+    for r in records:
+        if respect_official and r.orig_split == "test":
+            r.split = "test"
+        elif respect_official and r.orig_split == "train":
+            train_val.append(r)
+        else:
+            three_way.append(r)
+    _stratified_assign(train_val, {"train": train_r, "val": val_r}, rng)
+    _stratified_assign(three_way, {"train": train_r, "val": val_r, "test": test_r}, rng)
 
 
 # ==============================================================================
-# 9. PYTORCH SEGMENTATION DATASET (ĐỌC TRỰC TIẾP TỪ JSON HOẶC PNG)
+# 6. XUẤT DATASET + KIỂM TRA SAU KHI XUẤT
 # ==============================================================================
 
-if HAS_TORCH:
-    class SurfaceDefectSegmentationDataset(Dataset):
-        def __init__(self, root_dir: Path, split: str = "train", use_json_mask: bool = True,
-                     target_size: Optional[Tuple[int, int]] = None):
-            self.split_dir = root_dir / split
-            self.images_dir = self.split_dir / "images"
-            self.masks_dir = self.split_dir / "masks"
-            self.png_dir = self.split_dir / "masks_png"
-            self.use_json = use_json_mask
-            self.target_size = target_size
-            self.image_files = sorted(list(self.images_dir.glob("*.png")))
+def export_dataset(records: Sequence[SampleRecord], out_dir: Path, include_negatives: bool = False,
+                   overwrite: bool = False) -> Dict[str, int]:
+    """
+    Xuất data_segmentation/{train,val,test}/{img, ann, masks_png}.
+    include_negatives=False (mặc định): chỉ xuất ảnh CÓ khuyết tật (bài toán segmentation).
+    Thư mục đích đã có dữ liệu mà overwrite=False => báo lỗi (không xóa nhầm dữ liệu của bạn).
+    Chỉ xóa 3 thư mục train/val/test bên trong out_dir khi overwrite=True.
+    """
+    out_dir = Path(out_dir)
+    for sp in SPLITS:
+        d = out_dir / sp
+        if d.exists() and any(d.iterdir()):
+            if not overwrite:
+                raise FileExistsError(f"{d} đã có dữ liệu. Dùng overwrite=True (--overwrite) để ghi đè.")
+            shutil.rmtree(d)
+        for sub in ("img", "ann", "masks_png"):
+            (d / sub).mkdir(parents=True, exist_ok=True)
 
-        def __len__(self):
-            return len(self.image_files)
-
-        def __getitem__(self, idx):
-            img_file = self.image_files[idx]
-            stem = img_file.stem
-
-            img = Image.open(img_file).convert('RGB')
-            w, h = img.size
-
-            if self.use_json:
-                json_path = self.masks_dir / f"{stem}.json"
-                with open(json_path, "r", encoding="utf-8") as f:
-                    jdata = json.load(f)
-                mask_np = LabelMeJsonConverter.json_to_mask(jdata, w, h)
-                mask = Image.fromarray(mask_np)
-            else:
-                mask = Image.open(self.png_dir / f"{stem}.png").convert('L')
-
-            if self.target_size:
-                img = img.resize(self.target_size, Image.Resampling.BILINEAR)
-                mask = mask.resize(self.target_size, Image.Resampling.NEAREST)
-
-            img_np = np.array(img, dtype=np.float32) / 255.0
-            mask_np = (np.array(mask, dtype=np.float32) > 127).astype(np.float32)
-
-            boundary_np = BoundaryExtractor.extract_boundary(mask_np)
-            boundary_np = (boundary_np > 0).astype(np.float32)
-
-            return {
-                "image": torch.from_numpy(img_np).permute(2, 0, 1),
-                "mask": torch.from_numpy(mask_np).unsqueeze(0),
-                "boundary": torch.from_numpy(boundary_np).unsqueeze(0),
-                "sample_id": stem
-            }
+    counts = {sp: 0 for sp in SPLITS}
+    for r in records:
+        if not r.split or (not r.is_positive and not include_negatives):
+            continue
+        base = out_dir / r.split
+        ext = r.img_path.suffix.lower()
+        shutil.copy2(r.img_path, base / "img" / f"{r.sample_id}{ext}")
+        shutil.copy2(r.ann_path, base / "ann" / f"{r.sample_id}{ext}.json")
+        with open(r.ann_path, encoding="utf-8") as f:
+            mask, _ = ann_to_mask(json.load(f), r.width, r.height)
+        if mask.shape != (r.height, r.width):          # ann lệch kích thước ảnh -> ép về cỡ ảnh
+            mask = cv2.resize(mask, (r.width, r.height), interpolation=cv2.INTER_NEAREST)
+        Image.fromarray(mask, mode="L").save(base / "masks_png" / f"{r.sample_id}.png")
+        counts[r.split] += 1
+    return counts
 
 
-# Bí danh tương thích ngược toàn diện
-DefectExtractor = DefectSizeAnalyzer
-TrainAugmentor = CoupledSegmentationAugmentor
+def verify_export(out_dir: Path) -> dict:
+    """
+    Kiểm tra data_segmentation/: mỗi ảnh có đủ ann + mask; mask cùng kích thước ảnh;
+    mask chỉ gồm {0, 255}; mask PNG khớp với mask giải mã lại từ ann.
+    """
+    out_dir = Path(out_dir)
+    res = {"n_checked": 0, "problems": []}
+    for sp in SPLITS:
+        img_dir = out_dir / sp / "img"
+        if not img_dir.is_dir():
+            continue
+        for img_path in sorted(p for p in img_dir.iterdir() if p.suffix.lower() in IMG_EXTS):
+            res["n_checked"] += 1
+            tag = f"{sp}/{img_path.name}"
+            ann_p = ann_path_for(img_path)
+            mask_p = out_dir / sp / "masks_png" / f"{img_path.stem}.png"
+            if not ann_p.exists():
+                res["problems"].append((tag, "MISSING_ANN"))
+            if not mask_p.exists():
+                res["problems"].append((tag, "MISSING_MASK"))
+                continue
+            with Image.open(img_path) as im:
+                size = im.size
+            m = np.array(Image.open(mask_p))
+            if (m.shape[1], m.shape[0]) != size:
+                res["problems"].append((tag, f"SIZE_MISMATCH img={size} mask={(m.shape[1], m.shape[0])}"))
+            if not set(np.unique(m)).issubset({0, 255}):
+                res["problems"].append((tag, "MASK_NOT_BINARY"))
+            if ann_p.exists():
+                with open(ann_p, encoding="utf-8") as f:
+                    ref, _ = ann_to_mask(json.load(f))
+                if ref.shape == m.shape and not np.array_equal(ref, m):
+                    res["problems"].append((tag, "MASK_PNG_DIFFERS_FROM_ANN"))
+    return res
+
+
+# ==============================================================================
+# 7. AUGMENTATION ĐỒNG BỘ ẢNH + MASK (ONLINE, CHỈ DÙNG CHO TẬP TRAIN)
+# ==============================================================================
+
+class CoupledAugmentor:
+    """
+    Biến đổi hình học áp dụng CÙNG LÚC lên ảnh và mask (mask dùng nội suy nearest => vẫn nhị phân),
+    biến đổi quang học (độ sáng/tương phản) chỉ áp dụng lên ảnh.
+
+    Dùng online trong DataLoader (mỗi epoch ra biến thể khác nhau) nên không phình dung lượng đĩa
+    và không làm rò rỉ ảnh đã augment sang val/test.
+    Đầu vào/ra: image uint8 (H, W, 3), mask uint8 (H, W) với giá trị 0/255.
+    """
+
+    def __init__(self, p_hflip=0.5, p_vflip=0.5, p_rot90=0.5, p_affine=0.5,
+                 max_rotate_deg=15.0, scale_range=(0.9, 1.1), max_shift=0.05,
+                 p_photometric=0.5, brightness=0.2, contrast=0.2, seed: Optional[int] = None):
+        self.p_hflip, self.p_vflip, self.p_rot90, self.p_affine = p_hflip, p_vflip, p_rot90, p_affine
+        self.max_rotate_deg, self.scale_range, self.max_shift = max_rotate_deg, scale_range, max_shift
+        self.p_photometric, self.brightness, self.contrast = p_photometric, brightness, contrast
+        self.rng = np.random.default_rng(seed)
+
+    def __call__(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        r = self.rng
+        if r.random() < self.p_hflip:
+            image, mask = image[:, ::-1], mask[:, ::-1]
+        if r.random() < self.p_vflip:
+            image, mask = image[::-1], mask[::-1]
+        if r.random() < self.p_rot90:
+            k = int(r.integers(1, 4))
+            image, mask = np.rot90(image, k), np.rot90(mask, k)
+        image, mask = np.ascontiguousarray(image), np.ascontiguousarray(mask)
+
+        if r.random() < self.p_affine:
+            h, w = mask.shape
+            ang = r.uniform(-self.max_rotate_deg, self.max_rotate_deg)
+            sc = r.uniform(*self.scale_range)
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), ang, sc)
+            M[0, 2] += r.uniform(-self.max_shift, self.max_shift) * w
+            M[1, 2] += r.uniform(-self.max_shift, self.max_shift) * h
+            image = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_LINEAR,
+                                   borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            mask = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST,
+                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+        if r.random() < self.p_photometric:
+            a = 1.0 + r.uniform(-self.contrast, self.contrast)
+            b = r.uniform(-self.brightness, self.brightness) * 255.0
+            image = np.clip(image.astype(np.float32) * a + b, 0, 255).astype(np.uint8)
+        return image, mask
+
+
+# ==============================================================================
+# 8. PYTORCH DATASET
+# ==============================================================================
+
+class SurfaceDefectDataset(_TorchDataset):
+    """
+    Đọc data_segmentation/<split>/{img, masks_png}.
+    Mỗi mẫu trả về dict:
+        image    : float32 (3, H, W) trong [0, 1]
+        mask     : float32 (1, H, W) ∈ {0, 1}
+        boundary : float32 (1, H, W) ∈ {0, 1}  (cho Boundary-Aware Loss)
+        sample_id, is_positive
+    Là torch.Tensor nếu đã cài PyTorch, ngược lại là numpy.ndarray.
+
+    target_size = (H, W): bắt buộc nếu batch_size > 1 vì ảnh các nguồn khác kích thước.
+    augment=True chỉ nên bật cho split "train".
+    sources: lọc theo tiền tố, ví dụ ("ksdd2",) hoặc ("mt",).
+    """
+
+    def __init__(self, root_dir: Path, split: str = "train", target_size: Optional[Tuple[int, int]] = None,
+                 augment: bool = False, sources: Optional[Sequence[str]] = None,
+                 boundary_thickness: int = 1, augmentor: Optional[CoupledAugmentor] = None):
+        assert split in SPLITS, f"split phải thuộc {SPLITS}"
+        self.dir = Path(root_dir) / split
+        files = sorted(p for p in (self.dir / "img").iterdir() if p.suffix.lower() in IMG_EXTS)
+        if sources:
+            files = [p for p in files if any(p.stem.startswith(s + "_") for s in sources)]
+        self.files = files
+        self.target_size = target_size
+        self.boundary_thickness = boundary_thickness
+        self.augmentor = (augmentor or CoupledAugmentor()) if augment else None
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def __getitem__(self, idx: int) -> dict:
+        p = self.files[idx]
+        img = np.array(Image.open(p).convert("RGB"))
+        mask = np.array(Image.open(self.dir / "masks_png" / f"{p.stem}.png").convert("L"))
+        if self.augmentor:                      # augment ở kích thước gốc (rot90 có thể đổi H<->W)...
+            img, mask = self.augmentor(img, mask)
+        if self.target_size:                    # ...rồi mới resize => kích thước đầu ra luôn cố định
+            th, tw = self.target_size
+            img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_LINEAR)
+            mask = cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST)
+
+        boundary = (extract_boundary(mask, self.boundary_thickness) > 0).astype(np.float32)
+        out = {
+            "image": (img.astype(np.float32) / 255.0).transpose(2, 0, 1),
+            "mask": (mask > 127).astype(np.float32)[None],
+            "boundary": boundary[None],
+            "sample_id": p.stem,
+            "is_positive": bool((mask > 127).any()),
+        }
+        if HAS_TORCH:
+            for k in ("image", "mask", "boundary"):
+                out[k] = torch.from_numpy(np.ascontiguousarray(out[k]))
+        return out
